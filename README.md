@@ -77,4 +77,4 @@
 
 ---
 
-*由 AI 生成 · 作者 VeT_SHIUAN · 2026*
+*由 AI 生成 · 由愚蠢的人类vibe coding VeT_SHIUAN · 2026 09*
