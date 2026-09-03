@@ -2,7 +2,7 @@
 // @name         净搜 CleanSearch
 // @author       VeT_SHIUAN
 // @namespace    https://github.com/vetshiuan/cleansearch
-// @version      0.2.3
+// @version      0.2.4
 // @updateURL    https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @downloadURL  https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @description  搜索引擎去广告净化：屏蔽百度/谷歌/必应/360 竞价排名广告与推广内容，支持知乎/B站/豆瓣/微博/CSDN 广告过滤，自定义关键词与网址屏蔽，设置面板内置（油猴菜单唤起），无任何外部依赖与推广。
@@ -32,7 +32,7 @@
   'use strict';
 
   /* =====================================================================
-   * 净搜 CleanSearch Ver 0.2.3  |  作者：VeT_SHIUAN  |  License: MIT
+   * 净搜 CleanSearch Ver 0.2.4  |  作者：VeT_SHIUAN  |  License: MIT
    *
    * 本脚本为完全重写版，不含任何第三方推广、跳转或外部脚本依赖。
    *
@@ -50,7 +50,7 @@
    *   4. 用户自定义  关键词（标题+摘要）/ 网址（域名片段）
    * ===================================================================== */
 
-  const SCRIPT_VERSION = "0.2.3";
+  const SCRIPT_VERSION = "0.2.4";
   const CONFIG_KEY = 'cs_config';
   const MIGRATED_KEY = 'cs_migrated_v0';
 
@@ -618,22 +618,25 @@
     return null;
   }
 
-  // 域名须以独立 token 出现在文本中（两侧非字母/数字/点/横线），防摘要正文提到域名时误标
+  // 域名/品牌名 token 边界：前后不能是 ASCII 字母数字连字符 或 汉字 CJK
+  // 例："豆包"在"我爱豆包子"中前后是汉字/词字符 → 不算独立 token → 避免误报
+  const _isTokenChar = (c) => !c || /[\w一-鿿]/.test(c);
   function hasDomainToken(hay, dom) {
     if (!hay || !dom) return false;
     let i = 0;
     while ((i = hay.indexOf(dom, i)) >= 0) {
-      const pre = hay[i - 1];
-      const post = hay[i + dom.length];
-      if ((!pre || !/[a-z0-9-]/.test(pre)) && (!post || !/[a-z0-9-]/.test(post))) return true;
+      const pre = hay[i - 1], post = hay[i + dom.length];
+      if (!_isTokenChar(pre) && !_isTokenChar(post)) return true;
       i += dom.length;
     }
     return false;
   }
 
+  // 域名 OR 软件名任一命中即视为官方（百度新版卡片只显示品牌名不含域名）
   function siteOfficialName(hay) {
     for (const o of cfg.officialSites) {
-      if (hasDomainToken(hay, o[0])) return o[1];
+      const dom = o[0], name = o[1];
+      if (hasDomainToken(hay, dom) || hasDomainToken(hay, name)) return o[1];
     }
     return null;
   }
