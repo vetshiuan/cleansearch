@@ -2,7 +2,7 @@
 // @name         净搜 CleanSearch
 // @author       VeT_SHIUAN
 // @namespace    https://github.com/vetshiuan/cleansearch
-// @version      0.2.2
+// @version      0.2.3
 // @updateURL    https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @downloadURL  https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @description  搜索引擎去广告净化：屏蔽百度/谷歌/必应/360 竞价排名广告与推广内容，支持知乎/B站/豆瓣/微博/CSDN 广告过滤，自定义关键词与网址屏蔽，设置面板内置（油猴菜单唤起），无任何外部依赖与推广。
@@ -21,6 +21,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      baidu.com
 // @run-at       document-end
 // @noframes
@@ -31,7 +32,7 @@
   'use strict';
 
   /* =====================================================================
-   * 净搜 CleanSearch Ver 0.2.2  |  作者：VeT_SHIUAN  |  License: MIT
+   * 净搜 CleanSearch Ver 0.2.3  |  作者：VeT_SHIUAN  |  License: MIT
    *
    * 本脚本为完全重写版，不含任何第三方推广、跳转或外部脚本依赖。
    *
@@ -49,7 +50,7 @@
    *   4. 用户自定义  关键词（标题+摘要）/ 网址（域名片段）
    * ===================================================================== */
 
-  const SCRIPT_VERSION = "0.2.2";
+  const SCRIPT_VERSION = "0.2.3";
   const CONFIG_KEY = 'cs_config';
   const MIGRATED_KEY = 'cs_migrated_v0';
 
@@ -345,8 +346,14 @@
         method: 'GET',
         url: href,
         timeout: 4000,
+        redirect: 'manual', // 不跟随跳转：百度 link 中转会 302 到任意目标站，跟随会被 @connect 白名单拦截
         onload: (res) => {
-          const real = parseRealUrl(res.responseText);
+          let real = '';
+          // 手动模式下从响应头 Location 直接拿真实地址（无需 connect 目标域）
+          const hdrs = res.responseHeaders || '';
+          const lm = hdrs.match(/(?:^|\r?\n)[Ll]ocation:\s*(\S+)/);
+          if (lm) real = lm[1];
+          if (!real) real = parseRealUrl(res.responseText); // 兜底：HTML 里的 URL='...'
           linkCache.set(href, real);
           activeResolve--; cb(real); pumpResolve();
         },
@@ -611,15 +618,28 @@
     return null;
   }
 
-  function siteOfficialName(href) {
+  // 域名须以独立 token 出现在文本中（两侧非字母/数字/点/横线），防摘要正文提到域名时误标
+  function hasDomainToken(hay, dom) {
+    if (!hay || !dom) return false;
+    let i = 0;
+    while ((i = hay.indexOf(dom, i)) >= 0) {
+      const pre = hay[i - 1];
+      const post = hay[i + dom.length];
+      if ((!pre || !/[a-z0-9-]/.test(pre)) && (!post || !/[a-z0-9-]/.test(post))) return true;
+      i += dom.length;
+    }
+    return false;
+  }
+
+  function siteOfficialName(hay) {
     for (const o of cfg.officialSites) {
-      if (href && href.indexOf(o[0]) >= 0) return o[1];
+      if (hasDomainToken(hay, o[0])) return o[1];
     }
     return null;
   }
 
-  function isDownloadSite(href) {
-    return cfg.downloadSites.some(d => href && href.indexOf(d) >= 0);
+  function isDownloadSite(hay) {
+    return cfg.downloadSites.some(d => hasDomainToken(hay, d));
   }
 
   /**
@@ -690,7 +710,7 @@
       if (item.dataset.csGuard) return;
       const a = item.querySelector('h2 a[href], h3 a[href], a[href]');
       let href = effectiveHref(a);
-      // 百度结果 fallback：.c-showurl 直接显示真实域名，无需异步解析
+      // 百度结果 fallback：.c-showurl / cite 直接显示真实域名
       if (!href && location.hostname.indexOf('baidu.com') >= 0) {
         const cite = item.querySelector('.c-showurl, [class*="c-showurl"], cite, .c-color-gray');
         if (cite) {
@@ -698,12 +718,13 @@
           if (m) href = m[1];
         }
       }
-      if (!href) return;   // 必应 ck/a 或谷歌 /url 待用户重试
-      const name = siteOfficialName(href);
+      // 判定用「真实链接 + 结果文本」双通道：引擎改版/cite 类名变化都有兜底
+      const haystack = (href || '') + ' ' + (item.textContent || '').slice(0, 800);
+      const name = siteOfficialName(haystack);
       if (name) {
         item.dataset.csGuard = 'official';
         if (!officialItem) { officialItem = item; officialName = name; }
-      } else if (isDownloadSite(href)) {
+      } else if (isDownloadSite(haystack)) {
         item.dataset.csGuard = 'danger';
         dangerCount++;
       }
@@ -1032,8 +1053,9 @@
   GM_registerMenuCommand('▶ 立即重新净化', () => { runAll(); scheduleRun(600); });
 
   // 控制台接口：window.__CleanSearch.openPanel() / runAll() / runGuardian() / cfg() / version
+  // 注意：油猴默认跑在隔离世界，window 接口需经 unsafeWindow 暴露到页面主世界，页面 F12 才能访问
   try {
-    window.__CleanSearch = {
+    const api = {
       version: SCRIPT_VERSION,
       openPanel: openPanel,
       runAll: runAll,
@@ -1047,6 +1069,8 @@
         effectiveHref: effectiveHref,
       },
     };
+    if (typeof unsafeWindow !== 'undefined') unsafeWindow.__CleanSearch = api;
+    window.__CleanSearch = api;
   } catch (e) { /* 忽略 */ }
 
   function boot() {
