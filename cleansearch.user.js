@@ -34,12 +34,22 @@
   /* ===================================================================== *
    * 净搜 CleanSearch Ver 0.2.6 | 作者：VeT_SHIUAN | License: MIT
    *
-   * 0.2.6 修复记录（对应社区 Bug 报告 Issue1-4 + 自检）：
-   *  [Issue1] 护航"官方"判定改域名优先：下载站标题蹭品牌词不再绿标置顶；仅品牌名无域名证据时降级灰标"官方?"候选，下载站警示优先于官方判定
-   *  [Issue2] 护航弱意图词增加"前邻软件名"校验，杜绝"信用卡官方"/"官方"/"电脑版"等非下载查询误触发
-   *  [Issue3] 关闭总开关/百度站点开关后立即移除已注入净化样式，开关语义即时生效
-   *  [Issue4] 删除 ensureAdCSS 中只写不读的死代码 adCssInjected
-   *  [Self] 护航 candidate 分类允许在真实域名异步解析后升级为 official/danger，避免绿标失效、徽章与提示条按升级结果替换
+   * 0.2.6 修复记录（Issue 反馈 + 全码扫描）：
+   *  [I1] 官方判定只认结果真实域名；文本品牌名不再判官方/置顶。
+   *       三态互斥：official（域名命中官网库）/ danger（域名命中下载站库，
+   *       或标题含品牌词但域名非官网）/ unknown（无法判断，宁缺勿滥）
+   *  [I2] 弱意图词加前缀校验：前缀须形如软件名/品牌（官网库品牌或 ≥3 位字母数字），
+   *       "信用卡官方"、"官方"、"pc 端 电脑版" 不再误触发护航
+   *  [I3] 关闭总开关/百度开关时立即移除已注入的 #cs-adblock-style，「关闭」即时生效
+   *  [I4] 清理死代码（adCssInjected 只写不读、badgeTextPure 冗余变量）
+   *  [B1] nameTokenHit 串首/串尾边界修复（原实现把"无字符"当 token 字符，品牌位于开头永不命中）
+   *  [B2] 补全缺失的 parseRealUrl（原会抛 ReferenceError 并卡死并发解析池），
+   *       onload 整段兜底，保证并发槽位一定释放
+   *  [B3] 官网置顶/分类前先收敛到顶层结果容器（防谷歌嵌套 data-hveid 被重复分类、
+   *       嵌套 div 被挪到列表顶部破坏布局）
+   *  [B4] migrateOldConfig 全量容错；导出配置延迟回收 blob URL
+   *  [B5] 设置面板「取消」恢复打开时的配置快照（原版 collect 直改内存，取消并不真正取消）
+   *  [B6] 知乎弹窗关闭仅在确认弹窗上下文后点击（原版找不到弹窗容器时会误点任意按钮）
    *
    * 0.2.5 修复记录：
    *  [Fix1] 面板开关泄漏 800ms 轮询定时器 → 句柄统一保存，stopObserver 清除
@@ -178,8 +188,10 @@
    * §2 旧脚本数据迁移
    * ===================================================================== */
   function migrateOldConfig() {
-    if (GM_getValue(MIGRATED_KEY)) return;
+    // 【B4】整段容错：GM_getValue(MIGRATED_KEY) / GM_setValue 原在 try 外，
+    // 存储异常会直接中断 boot()，导致脚本整体不加载
     try {
+      if (GM_getValue(MIGRATED_KEY)) return;
       const old = GM_getValue('allconfig');
       if (old && typeof old === 'object') {
         const pick = (arr) => Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()).map(s => s.trim()) : [];
@@ -187,9 +199,9 @@
         if (!cfg.urls.length) cfg.urls = pick(old.pingbiurl);
         if (!cfg.whitelist.length) cfg.whitelist = pick(old.urlwhite);
       }
-    } catch (e) { /* 旧数据不存在，忽略 */ }
-    GM_setValue(MIGRATED_KEY, 1);
-    saveConfig();
+      GM_setValue(MIGRATED_KEY, 1);
+      saveConfig();
+    } catch (e) { /* 旧数据不存在或存储异常，忽略 */ }
   }
 
   /* ===================================================================== *
@@ -238,8 +250,7 @@
   const BADGE_TEXTS = ['广告', '商业推广', '推广', 'Sponsored', '赞助商广告', '赞助商链接', 'Ad', 'AD'];
 
   function badgeTextPure(el) {
-    let text = el.textContent || '';
-    if (!text) return '';
+    if (!(el.textContent || '')) return '';   // 【I4】顺手清理未使用的中间变量
     const node = el.cloneNode(true);  // 【Fix12】原变量名 clone 遮蔽同名工具函数，改名防混淆
     const deco = node.querySelectorAll('svg, img, i, em, b, u, s, video, canvas');
     for (const d of deco) d.remove();
@@ -325,6 +336,27 @@
     pumpResolve();
   }
 
+  // 【B2】从百度跳转中转页 HTML 中提取真实链接。
+  // 原版在此处调用了从未定义的 parseRealUrl：响应一旦缺少 Location 头，
+  // onload 内抛 ReferenceError → finishResolve 永不执行 → activeResolve 只增不减，
+  // 4 个并发槽位被耗尽后，后续所有跳转解析永久停摆（百度网址屏蔽彻底失效）。
+  function parseRealUrl(html) {
+    if (!html) return '';
+    const s = String(html);
+    const pats = [
+      /<meta[^>]+http-equiv=["']?refresh["']?[^>]+?url=([^"'>\s]+)/i,
+      /window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+      /location\.replace\(\s*["']([^"']+)["']\s*\)/i,
+      /<noscript>[\s\S]*?<a[^>]+href=["'](https?:\/\/[^"']+)["']/i,
+      /<a[^>]+href=["'](https?:\/\/[^"']+)["']/i,
+    ];
+    for (const re of pats) {
+      const m = s.match(re);
+      if (m && m[1] && /^https?:\/\//i.test(m[1])) return m[1];
+    }
+    return '';
+  }
+
   function pumpResolve() {
     while (activeResolve < MAX_CONCURRENT && resolveQueue.length) {
       const href = resolveQueue.shift();
@@ -337,10 +369,12 @@
         redirect: 'manual',
         onload: (res) => {
           let real = '';
-          const hdrs = res.responseHeaders || '';
-          const lm = hdrs.match(/(?:^|\r?\n)[Ll]ocation:\s*(\S+)/);
-          if (lm) real = lm[1];
-          if (!real) real = parseRealUrl(res.responseText);
+          try {
+            const hdrs = res.responseHeaders || '';
+            const lm = hdrs.match(/(?:^|\r?\n)[Ll]ocation:\s*(\S+)/);
+            if (lm) real = lm[1];
+            if (!real) real = parseRealUrl(res.responseText);
+          } catch (e) { /* 【B2】解析失败按未解析处理，保证并发槽位一定释放 */ }
           finishResolve(href, real);
         },
         onerror: () => finishResolve(href, ''),
@@ -352,22 +386,7 @@
   /* ===================================================================== *
    * §5 百度
    * ===================================================================== */
-  // 【Issue3】当前配置下当前页面是否需要百度广告隐藏样式（总开关 / 站点开关联动）
-  function needAdCSS() {
-    if (!cfg.enabled || inWhitelist()) return false;
-    const host = location.hostname;
-    if (host.indexOf('baidu.com') < 0) return false;
-    if (host === 'www.baidu.com' || host === 'm.baidu.com') return cfg.sites.baidu;
-    return cfg.sites.baiduSub;
-  }
-
-  // 【Issue3】开关关闭后移除已注入的净化样式，保证"关闭"立即生效
-  function syncAdCSS() {
-    try {
-      const st = document.getElementById('cs-adblock-style');
-      if (st && !needAdCSS()) st.remove();
-    } catch (e) { /* 忽略 */ }
-  }
+  // 【I4】移除只写不读的 adCssInjected 死代码（样式更新已由 getElementById + dataset.cs 校验接管）
 
   function ensureAdCSS() {
     try {
@@ -388,6 +407,17 @@
       st.dataset.cs = css;
       st.textContent = css;
       (document.head || document.documentElement).appendChild(st);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // 【I3】开关联动：净化不再覆盖百度搜索页时（总开关关闭/白名单/百度开关关闭），
+  // 主动移除已注入的 #cs-adblock-style，让「关闭」立即生效，而不是等下次刷新。
+  function refreshAdStyleState() {
+    try {
+      const st = document.getElementById('cs-adblock-style');
+      if (!st) return;
+      const active = cfg.enabled && !inWhitelist() && cfg.sites.baidu;
+      if (!active) st.remove();
     } catch (e) { /* 忽略 */ }
   }
 
@@ -530,9 +560,11 @@
     // 【Fix9】确认是登录/注册/App 推广弹窗才点关闭，避免误关其他弹窗（如退出确认）
     const closeBtn = document.querySelector('.Modal-closeButton, .signFlowModal-container ~ .Button');
     if (closeBtn) {
+      // 【B6】仅在能确认弹窗上下文且内容匹配时才点击：
+      // 原版 !modal 反而放行——选中的按钮若不在弹窗内，会误点页面上任意按钮
       const modal = closeBtn.closest('.Modal, [class*="Modal"]');
       const t = modal ? (modal.textContent || '') : '';
-      if (!modal || /登录|注册|扫码|下载App|打开App/.test(t)) closeBtn.click();
+      if (modal && /登录|注册|扫码|下载App|打开App/.test(t)) closeBtn.click();
     }
   }
 
@@ -561,28 +593,29 @@
    * §7.5 护航模块（0.2.0）
    * ===================================================================== */
 
-  // 【Fix4】下载意图识别重写：
+  // 【Fix4+I2】下载意图识别：
   //  - 强意图词（下载/安装包/官网）：查询中任意位置出现即算
-  //  - 弱意图词（官方/电脑版/客户端…）：只有紧跟软件名、位于查询收尾才算（"微信 官方" ✔ / "苹果官方回应…" ✘）
+  //  - 弱意图词（官方/电脑版/客户端…）：必须位于查询收尾，且前缀须形如软件名/品牌
+  //    （"微信 官方" ✔ / "信用卡官方"、"官方"、"pc 端 电脑版" ✘）
   //  - 资讯类词（回应/事件/新闻…）：命中即排除整个护航
   //  - 只看搜索词本身，不再用 document.title 兜底（误触发重灾区）
-  //  - 【Issue2】弱词命中后二次校验前缀确实像"软件名"，杜绝"信用卡官方"/"官方"这类误触发
   const DL_STRONG_WORDS = ['下载', '安装包', '官网'];
   const DL_WEAK_WORDS = ['官方', '官方版', '电脑版', '电脑端', '客户端', 'pc版', 'pc端'];
   const DL_NEWS_RE = /回应|辟谣|声明|通报|公告|道歉|起诉|申诉|被罚|被黑|被曝|崩了|宕机|打不开|无法访问|下架|事件|新闻|爆料|热搜|发布会/;
-  // 这些词是通用实体/机构名，不属于"软件名"，弱词前出现它们不算下载意图
-  const DL_GENERIC_RE = /信用卡|银行卡|贷款|基金|保险|股票|证券|医院|学校|大学|公司|企业|网站|平台|服务|客服|电话|热线|手机|宽带|流量|套餐|活动|优惠|新闻|政策|规定|标准|通知|报告|数据|地址|账号|邮箱|渠道|品牌|产品|价格|下载站|资源站|官网$/;
 
-  // 【Issue2】弱意图词命中后：弱词之前的 token 必须像"软件名/品牌名"
-  function weakWordPrefixedBySoftware(q, w) {
-    const prefix = q.slice(0, -w.length).trim();
-    if (!prefix) return false;                                   // "官方" / "电脑版" 单独成查询
-    const last = prefix.split(/[\s,，、;；:：]+/).pop().trim();    // 取弱词前最后一个 token
-    if (!last || last.length < 2) return false;                  // 实体名至少 2 字符
-    if (DL_WEAK_WORDS.indexOf(last) >= 0) return false;          // 前邻仍是弱词（"pc端 电脑版"）
-    if (/^[这那哪怎么为什么为何是否啥何如何吗呢吧么的了？?！!]+$/.test(last)) return false;
-    if (DL_GENERIC_RE.test(last)) return false;                  // 通用名词不算软件名
-    return true;
+  // 【I2】弱意图词前缀校验：前缀须"像一个软件名/品牌"——
+  //  - 非空且 ≥2 字符；
+  //  - 命中官网库品牌名（如"微信 官方"），或含 ≥3 位字母数字 token（如 potplayer / obs）；
+  //  - 疑问/口语开头（这是/什么/怎么…）直接拒绝。
+  //  这样"信用卡官方"、"官方"这类无软件实体的查询不再误触发护航。
+  function weakIntentPrefixOk(prefix) {
+    const p = String(prefix || '').trim().toLowerCase();
+    if (p.length < 2) return false;
+    if (/^(这是|什么|怎么|为什么|为啥|啥|哪个|哪些|如何|难道|到底|究竟)/.test(p)) return false;
+    for (const o of cfg.officialSites) {
+      if (nameTokenHit(p, String(o[1]).toLowerCase())) return true;
+    }
+    return /[a-z0-9][a-z0-9.+-]{2,}/.test(p);
   }
 
   function hasDownloadIntent() {
@@ -595,7 +628,13 @@
     if (!q) return false;
     if (DL_NEWS_RE.test(q)) return false;
     if (DL_STRONG_WORDS.some(w => q.indexOf(w) >= 0)) return true;
-    return DL_WEAK_WORDS.some(w => q.endsWith(w) && weakWordPrefixedBySoftware(q, w));
+    // 【I2】弱意图词：收尾命中后校验前缀，防止"信用卡官方"等非下载查询误触发
+    for (const w of DL_WEAK_WORDS) {
+      if (!q.endsWith(w)) continue;
+      if (q.length <= w.length) return false;   // 查询仅剩弱词本身（"官方"/"电脑版"）
+      return weakIntentPrefixOk(q.slice(0, q.length - w.length));
+    }
+    return false;
   }
 
   function getResultCtx() {
@@ -682,9 +721,10 @@
     return false;
   }
 
-  // 品牌名 token 边界：前后不能是 ASCII 字母数字连字符 或 汉字 CJK
+  // 品牌名 token 边界：前后不能是 ASCII 字母数字下划线 或 汉字 CJK
   // 例："豆包"在"我爱豆包子"中前后是汉字 → 不算独立 token → 避免误报
-  const _isTokenChar = (c) => !c || /[\w一-鿿]/.test(c);
+  // 【B1】串首/串尾视为边界（原实现把"无字符"误当 token 字符，品牌位于开头时永不命中）
+  const _isTokenChar = (c) => c !== undefined && c !== '' && /[\w一-鿿]/.test(c);
   function nameTokenHit(hay, name) {
     if (!hay || !name) return false;
     const h = String(hay), n = String(name);
@@ -697,8 +737,8 @@
     return false;
   }
 
-  // 【Issue1】"官方"判定优先以真实域名为准：只有域名命中官网库才算 official。
-  // 品牌名不再参与官方判定，只作为域名无证据时的"候选"兜底，防止下载站标题蹭品牌词获得绿标置顶。
+  // 【I1】官方判定只认「域名命中」：文本里出现品牌名不再作为官方依据。
+  // （原版域名 OR 软件名任一命中即判官方，聚合下载站可在标题里放品牌词骗绿标并置顶）
   function siteOfficialName(hay) {
     for (const o of cfg.officialSites) {
       if (domainHit(hay, o[0])) return o[1];
@@ -706,10 +746,14 @@
     return null;
   }
 
-  // 品牌名 token 兜底：百度新版结果卡片可能只展示品牌名、拿不到可解析域名时使用
-  function officialNameCandidate(hay) {
+  // 【I1】品牌名包含匹配：仅用于 danger 甄别（标题含品牌词但域名非官网）与
+  // 弱意图词前缀校验（weakIntentPrefixOk），绝不用于判 official。
+  function brandNameHit(hay) {
+    if (!hay) return null;
+    const h = String(hay).toLowerCase();
     for (const o of cfg.officialSites) {
-      if (nameTokenHit(hay, o[1])) return o[1];
+      const n = String(o[1]).toLowerCase();
+      if (n && h.indexOf(n) >= 0) return o[1];
     }
     return null;
   }
@@ -719,20 +763,18 @@
   }
 
   function guardBadgeStyle(kind) {
-    const base = 'display:inline-block;margin-right:8px;padding:1px 8px;line-height:20px;font-size:12px;border-radius:4px;font-weight:700;vertical-align:middle;';
-    if (kind === 'official') return base + 'background:#16a34a;color:#fff;';
-    if (kind === 'danger') return base + 'background:#d97706;color:#fff;';
-    return base + 'background:#64748b;color:#fff;'; // candidate：灰标"官方?"待核实
+    return 'display:inline-block;margin-right:8px;padding:1px 8px;line-height:20px;font-size:12px;border-radius:4px;'
+      + (kind === 'official'
+        ? 'background:#16a34a;color:#fff;font-weight:700;vertical-align:middle;'
+        : 'background:#d97706;color:#fff;font-weight:700;vertical-align:middle;');
   }
 
   function showGuardBanner(kind, name) {
-    if (!cfg.guardian.banner) return;
-    const exist = document.querySelector('#cs-guard-banner');
-    if (exist && kind !== 'official') return;   // warn 不覆盖已有提示；official 优先级更高可升级替换
+    if (!cfg.guardian.banner || document.querySelector('#cs-guard-banner')) return;
     const ctx = getResultCtx();
     const list = getListEl(ctx);
     if (!list) return;
-    const banner = exist || document.createElement('div');
+    const banner = document.createElement('div');
     banner.id = 'cs-guard-banner';
     if (kind === 'official') {
       banner.textContent = '净搜护航：已识别并置顶官方站点（' + (name || '官方') + '），请认准绿色「官方」标识 ✔';
@@ -741,7 +783,48 @@
       banner.textContent = '⚠ 净搜护航：本页未识别到可信官网，出现多个非官方下载站结果，下载前请核实站点，谨防捆绑流氓软件';
       banner.style.cssText = 'margin:0 0 10px;padding:10px 14px;background:#fffbeb;color:#92400e;border:1px solid #fde68a;border-radius:8px;font-size:13px;';
     }
-    if (!exist) list.insertBefore(banner, list.firstChild);
+    list.insertBefore(banner, list.firstChild);
+  }
+
+  // 【I1/B3】顶层结果容器：谷歌的 data-hveid 存在多层嵌套（一条结果内多个嵌套 div 均命中），
+  // 逐条分类会重复打标、置顶时还可能把嵌套 div 挪到列表顶部破坏布局。
+  // 统一先收敛到顶层结果容器再处理。
+  const TOP_RESULT_SEL = '#rso > div, #search > div, #b_results > li, #content_left > div, #results > div, #main > div';
+
+  // 【I1】单条结果分类，三态互斥：
+  //  - official：结果真实域名命中官网库（唯一可信依据）
+  //  - danger  ：域名（或结果可见文本中的域名）命中下载站警示库，
+  //              或域名明确非官网但标题含品牌词（聚合下载站借品牌词引流的最常见形态）
+  //  - unknown ：无法判断（含跳转解析中/无链接信息）——宁缺勿滥，
+  //              仅文本含品牌名不再判官方，更不置顶
+  function classifyGuardianItem(item) {
+    const a = item.querySelector('h2 a[href], h3 a[href], a[href]');
+    let href = effectiveHref(a);
+    // 【I1】百度结果以 .c-showurl 显示目标域名；跳转解析失败/未完成时也用它兜底
+    if (location.hostname.indexOf('baidu.com') >= 0) {
+      if (!href || /baidu\.com\/(link|bh)/.test(href)) {
+        const cite = item.querySelector('.c-showurl, [class*="c-showurl"], cite, .c-color-gray');
+        if (cite) {
+          const m = (cite.textContent || '').match(/([a-z0-9-]+\.[a-z0-9.-]+)/i);
+          if (m) href = m[1];
+        }
+      }
+    }
+    const link = String(href || '');
+    const text = (item.textContent || '').slice(0, 800);
+    const title = (textOf(item.querySelector('h2, h3')) || text.slice(0, 120)).toLowerCase();
+
+    // 1) 真实域名命中官网库 → official（只认域名，不信文本品牌名）
+    if (link) {
+      const name = siteOfficialName(link);
+      if (name) return { kind: 'official', name: name };
+    }
+    // 2) 域名（链接或结果可见文本）命中下载站警示库 → danger
+    if (isDownloadSite(link) || isDownloadSite(text)) return { kind: 'danger', name: '' };
+    // 3) 域名明确但非官网库域名，标题却含品牌词 → danger
+    if (link && brandNameHit(title)) return { kind: 'danger', name: '' };
+    // 4) 无法验证域名（解析中/无链接）→ unknown，等待下一轮解析完成后重判
+    return { kind: 'unknown', name: '' };
   }
 
   function runGuardian() {
@@ -749,39 +832,29 @@
     if (!hasDownloadIntent()) return;
     const ctx = getResultCtx();
     if (!ctx) return;
-    const items = $$(ctx.items);
+    // 【B3】按顶层结果容器去重（谷歌 data-hveid 嵌套场景）
+    const seenTop = new Set();
+    const items = $$(ctx.items).filter(el => {
+      const top = el.closest(TOP_RESULT_SEL) || el;
+      if (seenTop.has(top)) return false;
+      seenTop.add(top);
+      return true;
+    });
     if (!items.length) return;
 
     let officialItem = null, officialName = '', dangerCount = 0;
 
-    // ① 分类（official/danger 已定性则跳过；candidate 允许解析出真实域名后升级重判）
+    // ① 分类（已处理过的跳过，保证幂等与三态互斥）
     items.forEach(item => {
-      if (item.dataset.csGuard === 'official' || item.dataset.csGuard === 'danger') return;
-      const a = item.querySelector('h2 a[href], h3 a[href], a[href]');
-      let href = effectiveHref(a);
-      if (!href && location.hostname.indexOf('baidu.com') >= 0) {
-        const cite = item.querySelector('.c-showurl, [class*="c-showurl"], cite, .c-color-gray');
-        if (cite) {
-          const m = (cite.textContent || '').match(/([a-z0-9-]+\.[a-z0-9.-]+)/i);
-          if (m) href = m[1];
-        }
-      }
-      const haystack = (href || '') + ' ' + (item.textContent || '').slice(0, 800);
-      // 【Issue1】互斥三态：danger(下载站域名) > official(官网域名) > candidate(仅品牌名出现)
-      if (isDownloadSite(haystack)) {
+      if (item.dataset.csGuard) return;
+      const info = classifyGuardianItem(item);
+      if (info.kind === 'official') {
+        item.dataset.csGuard = 'official';
+        if (!officialItem) { officialItem = item; officialName = info.name; }
+      } else if (info.kind === 'danger') {
         item.dataset.csGuard = 'danger';
         dangerCount++;
-        return;
       }
-      const name = siteOfficialName(haystack);
-      if (name) {
-        item.dataset.csGuard = 'official';
-        if (!officialItem) { officialItem = item; officialName = name; }
-        return;
-      }
-      // 品牌名仅兜底为"候选"（灰标"官方?"提示核实）：不置顶、不给绿标；
-      // 等真实域名解析/文本中露出域名后，下轮可升级为 official 或 danger
-      if (officialNameCandidate(haystack)) item.dataset.csGuard = 'candidate';
     });
 
     // ② 加徽章（官方绿标 / 下载站黄标）
@@ -789,34 +862,26 @@
     if (flag) {
       items.forEach(item => {
         const kind = item.dataset.csGuard;
-        if (kind !== 'official' && kind !== 'danger' && kind !== 'candidate') return;
-        const show = kind === 'danger'
-          ? cfg.guardian.warnDownload
-          : cfg.guardian.pinOfficial; // official/candidate 均跟随「官网置顶+绿标」开关
+        if (kind !== 'official' && kind !== 'danger') return;
+        const show = kind === 'official' ? cfg.guardian.pinOfficial : cfg.guardian.warnDownload;
         if (!show) return;
         const title = item.querySelector('h2, h3') || item;
-        if (!title) return;
-        const oldBadge = title.querySelector('.cs-guard-badge');
-        if (oldBadge) {
-          if (oldBadge.dataset.kind === kind) return;
-          oldBadge.remove(); // 分类升级/变更（candidate → official/danger）时替换旧徽章
-        }
+        if (!title || title.querySelector('.cs-guard-badge')) return;
         const badge = document.createElement('span');
         badge.className = 'cs-guard-badge';
-        badge.dataset.kind = kind;
-        badge.textContent = kind === 'official' ? '官方'
-          : (kind === 'danger' ? '⚠ 下载站' : '官方?');
+        badge.textContent = kind === 'official' ? '官方' : '⚠ 非官方';
         badge.style.cssText = guardBadgeStyle(kind);
         title.insertBefore(badge, title.firstChild);
         if (kind === 'danger') item.style.opacity = '0.6';
       });
     }
 
-    // ③ 官网置顶
+    // ③ 官网置顶（【B3】先收敛到顶层结果容器，防嵌套节点被挪到列表顶部破坏布局）
     if (officialItem && cfg.guardian.pinOfficial) {
       const list = getListEl(ctx);
-      if (list && list.firstElementChild !== officialItem) {
-        list.insertBefore(officialItem, list.firstChild);
+      if (list) {
+        const pin = officialItem.closest(TOP_RESULT_SEL) || officialItem;
+        if (list.firstElementChild !== pin) list.insertBefore(pin, list.firstChild);
       }
     }
 
@@ -936,8 +1001,8 @@
 
   function closePanel() {
     if (panelHost) { panelHost.remove(); panelHost = null; }
-    // 【Issue3】总开关/站点开关被关闭时，立即移除已注入的净化样式，避免"关闭"在当前页面不生效
-    syncAdCSS();
+    // 【I3】关面板后同步样式状态：若总开关/百度开关/白名单已变化，立即移除已注入的隐藏样式
+    refreshAdStyleState();
     // 【Fix8】只有启用且不在白名单时才重启监听；并立即重扫一次让新配置生效
     if (cfg.enabled && !inWhitelist()) {
       startObserver();
@@ -1046,8 +1111,12 @@
       setTimeout(() => t.remove(), 1500);
     };
 
-    root.getElementById('cs-mask').addEventListener('click', e => { if (e.target.id === 'cs-mask') closePanel(); });
-    root.getElementById('cs-cancel').addEventListener('click', closePanel);
+    // 【B5】取消 = 恢复打开面板时的配置快照（原版 collect 直改内存配置，取消并不真正取消）
+    const backup = clone(cfg);
+    const cancelPanel = () => { cfg = backup; closePanel(); };
+
+    root.getElementById('cs-mask').addEventListener('click', e => { if (e.target.id === 'cs-mask') cancelPanel(); });
+    root.getElementById('cs-cancel').addEventListener('click', cancelPanel);
     root.getElementById('cs-save').addEventListener('click', () => {
       collect();
       saveConfig();
@@ -1069,7 +1138,8 @@
       a.href = URL.createObjectURL(blob);
       a.download = 'cleansearch-config.json';
       a.click();
-      URL.revokeObjectURL(a.href);
+      // 【B4】延迟回收 blob URL：立即 revoke 在部分浏览器会导致下载拿到空文件
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     });
     root.getElementById('cs-import').addEventListener('click', () => root.getElementById('cs-file').click());
     root.getElementById('cs-file').addEventListener('change', e => {
@@ -1096,7 +1166,7 @@
    * 启动
    * ===================================================================== */
   GM_registerMenuCommand('⚙ 净搜 · 设置', openPanel);
-  GM_registerMenuCommand('▶ 立即重新净化', () => { runAll(); scheduleRun(600); });
+  GM_registerMenuCommand('▶ 立即重新净化', () => { refreshAdStyleState(); runAll(); scheduleRun(600); });
 
   try {
     const api = {
@@ -1107,11 +1177,18 @@
       cfg: () => cfg,
       probe: {
         hasDownloadIntent: hasDownloadIntent,
+        weakIntentPrefixOk: weakIntentPrefixOk,
         getResultCtx: getResultCtx,
         siteOfficialName: siteOfficialName,
+        brandNameHit: brandNameHit,
+        nameTokenHit: nameTokenHit,
+        domainHit: domainHit,
         isDownloadSite: isDownloadSite,
         effectiveHref: effectiveHref,
         decodeBingU: decodeBingU,
+        parseRealUrl: parseRealUrl,
+        classifyGuardianItem: classifyGuardianItem,
+        refreshAdStyleState: refreshAdStyleState,
       },
     };
     if (typeof unsafeWindow !== 'undefined') unsafeWindow.__CleanSearch = api;
