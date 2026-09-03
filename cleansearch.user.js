@@ -2,7 +2,9 @@
 // @name         净搜 CleanSearch
 // @author       VeT_SHIUAN
 // @namespace    https://github.com/vetshiuan/cleansearch
-// @version      0.1.2
+// @version      0.2.2
+// @updateURL    https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
+// @downloadURL  https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @description  搜索引擎去广告净化：屏蔽百度/谷歌/必应/360 竞价排名广告与推广内容，支持知乎/B站/豆瓣/微博/CSDN 广告过滤，自定义关键词与网址屏蔽，设置面板内置（油猴菜单唤起），无任何外部依赖与推广。
 // @match        *://*.baidu.com/*
 // @match        *://*.google.com/*
@@ -29,7 +31,7 @@
   'use strict';
 
   /* =====================================================================
-   * 净搜 CleanSearch Ver 0.1.2  |  作者：VeT_SHIUAN  |  License: MIT
+   * 净搜 CleanSearch Ver 0.2.2  |  作者：VeT_SHIUAN  |  License: MIT
    *
    * 本脚本为完全重写版，不含任何第三方推广、跳转或外部脚本依赖。
    *
@@ -47,7 +49,7 @@
    *   4. 用户自定义  关键词（标题+摘要）/ 网址（域名片段）
    * ===================================================================== */
 
-  const SCRIPT_VERSION = "0.1.2";
+  const SCRIPT_VERSION = "0.2.2";
   const CONFIG_KEY = 'cs_config';
   const MIGRATED_KEY = 'cs_migrated_v0';
 
@@ -79,6 +81,56 @@
     keywords: [],           // 屏蔽关键词（标题或摘要包含即删）
     urls: [],               // 屏蔽网址（链接包含即删，填域名片段）
     whitelist: [],          // 白名单（当前页地址包含其中之一时本脚本不工作）
+    /* ---- 0.2.0 护航模块：官网置顶 / 下载站警示 ---- */
+    guardian: {
+      enabled: true,        // 护航总开关
+      pinOfficial: true,    // 官网结果置顶 + 绿色「官方」徽章
+      warnDownload: true,   // 下载站结果置灰 + 黄色警示徽章
+      banner: true,         // 页面顶部提示条（找到官网提示置顶 / 未找到则警示慎下）
+    },
+    officialSites: [        // 官网库：[域名片段, 软件名]（命中 href 含该域名即官方）
+      ['weixin.qq.com', '微信'], ['im.qq.com', 'QQ'], ['work.weixin.qq.com', '企业微信'],
+      ['docs.qq.com', '腾讯文档'], ['meeting.tencent.com', '腾讯会议'],
+      ['dingtalk.com', '钉钉'], ['feishu.cn', '飞书'], ['wps.cn', 'WPS Office'],
+      ['kdocs.cn', '金山文档'], ['alipay.com', '支付宝'], ['taobao.com', '淘宝'],
+      ['tmall.com', '天猫'], ['jd.com', '京东'], ['pinduoduo.com', '拼多多'],
+      ['douyin.com', '抖音'], ['kuaishou.com', '快手'], ['xiaohongshu.com', '小红书'],
+      ['iqiyi.com', '爱奇艺'], ['v.qq.com', '腾讯视频'], ['youku.com', '优酷'],
+      ['music.163.com', '网易云音乐'], ['y.qq.com', 'QQ音乐'], ['kugou.com', '酷狗'],
+      ['kuwo.cn', '酷我'], ['bilibili.com', '哔哩哔哩'], ['ximalaya.com', '喜马拉雅'],
+      ['keep.com', 'Keep'], ['weibo.com', '微博'], ['zhihu.com', '知乎'],
+      ['csdn.net', 'CSDN'], ['github.com', 'GitHub'], ['gitee.com', 'Gitee'],
+      ['pan.baidu.com', '百度网盘'], ['xunlei.com', '迅雷'],
+      ['google.cn/chrome', '谷歌浏览器'], ['microsoftedge.microsoft.com', 'Edge浏览器'],
+      ['mozilla.org', 'Firefox浏览器'], ['se.360.cn', '360安全浏览器'],
+      ['360.cn', '360安全卫士'], ['huorong.cn', '火绒安全'], ['pc.qq.com', '腾讯电脑管家'],
+      ['duba.net', '金山毒霸'], ['ludashi.com', '鲁大师'], ['drivergenius.com', '驱动精灵'],
+      ['160.com', '驱动人生'], ['cpuid.com', 'CPU-Z'], ['techpowerup.com', 'GPU-Z'],
+      ['rarlab.com', 'WinRAR'], ['7-zip.org', '7-Zip'], ['bandisoft.com', 'Bandizip'],
+      ['notepad-plus-plus.org', 'Notepad++'], ['code.visualstudio.com', 'VS Code'],
+      ['obsproject.com', 'OBS Studio'], ['videolan.org', 'VLC'],
+      ['potplayer.daum.net', 'PotPlayer'], ['sunlogin.com', '向日葵远程'],
+      ['todesk.com', 'ToDesk'], ['teamviewer.com', 'TeamViewer'], ['anydesk.com', 'AnyDesk'],
+      ['ldmnq.com', '雷电模拟器'], ['mumu.163.com', 'MuMu模拟器'], ['yeshen.com', '夜神模拟器'],
+      ['bluestacks.com', '蓝叠模拟器'], ['yuque.com', '语雀'], ['weread.qq.com', '微信读书'],
+      ['shurufa.baidu.com', '百度输入法'], ['pinyin.sogou.com', '搜狗输入法'],
+      ['capcut.cn', '剪映'], ['ulikecam.com', '剪映专业版'], ['pcfreetime.com', '格式工厂'],
+      ['obsproject.com', 'OBS'], ['aliyun.com', '阿里云'], ['cloud.tencent.com', '腾讯云'],
+      ['youzhiyun.com', '优志愿'], ['qidian.com', '起点中文网'], ['fanqienovel.com', '番茄小说'],
+      ['doubao.com', '豆包'], ['kimi.moonshot.cn', 'Kimi'], ['tongyi.aliyun.com', '通义千问'], ['deepseek.com', 'DeepSeek'],
+    ],
+    downloadSites: [        // 下载站警示库：知名聚合下载站域名片段（命中即警示）
+      'pc6.com', 'onlinedown.net', 'downxia.com', 'duote.com', 'cr173.com',
+      'xiazaiba.com', 'yxdown.com', 'uzzf.com', 'downcc.com', 'skycn.com',
+      'software.com.cn', 'dl.pconline.com.cn', 'xiazai.zol.com.cn', 'winwin7.com',
+      'winwin10.com', 'xp510.com', '2265.com', '2345.com', 'mydrivers.com',
+      'ali213.net', '3dmgame.com', 'gamersky.com', 'youxia.com', 'pchome.net',
+      'downxia.com', 'woaidownload.com', 'pk38.com', '8510.com', 'down55.com',
+      '688dd.com', 'gxspc.com', 'pc860.com', 'imdown.net', 'xiazaigame.com',
+      '7down.com', 'softpedia.com', 'tweaking.com', 'ruan8.com', 'cngrj.com',
+      'xiazaigl.com', 'lanzous.com', 'xiaoshuo520.com', 'cscz.com', 'win8xiazai.com',
+      'dngs.com', 'pconline.com.cn/download', 'csdown.com', 'ddooo.com', 'bkill.com',
+    ],
   };
 
   // 深合并：数组与普通值以「新值覆盖旧值」处理
@@ -533,6 +585,163 @@
   }
 
   /* =====================================================================
+   * §7.5 护航模块（0.2.0）
+   * 面向小白用户：在「下载意图」搜索结果里识别并置顶官网（绿标），
+   * 对知名聚合下载站打警示（置灰+黄标），防被流氓软件捆绑坑害。
+   * ===================================================================== */
+
+  const DOWNLOAD_INTENT_WORDS = ['官网', '官方', '官方下载', '官方app', 'app下载', '下载',
+    '软件下载', '电脑版', '电脑端', '客户端', 'pc版', 'pc端', '下载中心', '下载站'];
+
+  // 当前搜索词/页面标题是否含下载意图
+  function hasDownloadIntent() {
+    const m = location.search.match(/[?&](?:wd|word|q|query|kw)=([^&]+)/);
+    const q = m ? decodeURIComponent(m[1]) : '';
+    const text = q + ' ' + document.title;
+    return DOWNLOAD_INTENT_WORDS.some(w => text.indexOf(w) >= 0);
+  }
+
+  // 各引擎结果容器
+  function getResultCtx() {
+    const host = location.hostname;
+    if (host === 'www.baidu.com' || host === 'm.baidu.com') return { list: '#content_left, #results', items: '#content_left > div, #results > div' };
+    if (/\.google\./.test(host)) return { list: '#search', items: '#search div[data-hveid]' };
+    if (host.indexOf('bing.com') >= 0) return { list: '#b_results', items: '#b_results li.b_algo' };
+    if (host.indexOf('so.com') >= 0) return { list: '#main', items: '.res-list' };
+    return null;
+  }
+
+  function siteOfficialName(href) {
+    for (const o of cfg.officialSites) {
+      if (href && href.indexOf(o[0]) >= 0) return o[1];
+    }
+    return null;
+  }
+
+  function isDownloadSite(href) {
+    return cfg.downloadSites.some(d => href && href.indexOf(d) >= 0);
+  }
+
+  /**
+   * 提取结果的真实链接（部分引擎用跳转链包住真实 URL）：
+   * - 必应 bing.com/ck/a?  → u 参数为 base64url(真实地址)
+   * - 谷歌 google.com/url? → q 参数明文
+   * - 百度 baidu.com/link? → 读已解析缓存，未解析则入队并安排重扫
+   */
+  function effectiveHref(a) {
+    let href = a && a.href ? a.href : '';
+    if (!href) return '';
+    const host = location.hostname;
+    if (host.indexOf('bing.com') >= 0) {
+      const m = href.match(/[?&]u=a1([A-Za-z0-9_-]+)/);
+      if (m) {
+        try {
+          const b = atob('a1' + m[1].replace(/-/g, '+').replace(/_/g, '/'));
+          return new TextDecoder().decode(Uint8Array.from(b, c => c.charCodeAt(0))) || href;
+        } catch (e) { /* 解码失败回落原链接 */ }
+      }
+    } else if (/\.google\./.test(host)) {
+      const m = href.match(/[?&]q=([^&]+)/);
+      if (m) { try { return decodeURIComponent(m[1]) || href; } catch (e) {} }
+    } else if (host.indexOf('baidu.com') >= 0 && /baidu\.com\/(link|bh)/.test(href)) {
+      if (linkCache.has(href)) return linkCache.get(href) || href;
+      queueResolve(href, () => scheduleRun(150)); // 异步解析完成后自动重扫护航
+      return '';
+    }
+    return href;
+  }
+
+  function guardBadgeStyle(kind) {
+    return 'display:inline-block;margin-right:8px;padding:1px 8px;line-height:20px;font-size:12px;border-radius:4px;' +
+      (kind === 'official'
+        ? 'background:#16a34a;color:#fff;font-weight:700;vertical-align:middle;'
+        : 'background:#d97706;color:#fff;font-weight:700;vertical-align:middle;');
+  }
+
+  function showGuardBanner(kind, name) {
+    if (!cfg.guardian.banner || document.querySelector('#cs-guard-banner')) return;
+    const ctx = getResultCtx();
+    const list = ctx && document.querySelector(ctx.list.split(',')[0]);
+    if (!list) return;
+    const banner = document.createElement('div');
+    banner.id = 'cs-guard-banner';
+    if (kind === 'official') {
+      banner.textContent = '净搜护航：已识别并置顶官方站点（' + (name || '官方') + '），请认准绿色「官方」标识 ✔';
+      banner.style.cssText = 'margin:0 0 10px;padding:10px 14px;background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;font-size:13px;';
+    } else {
+      banner.textContent = '⚠ 净搜护航：本页未识别到可信官网，出现多个非官方下载站结果，下载前请核实站点，谨防捆绑流氓软件';
+      banner.style.cssText = 'margin:0 0 10px;padding:10px 14px;background:#fffbeb;color:#92400e;border:1px solid #fde68a;border-radius:8px;font-size:13px;';
+    }
+    list.insertBefore(banner, list.firstChild);
+  }
+
+  function runGuardian() {
+    if (!cfg.guardian.enabled || inWhitelist()) return;
+    if (!hasDownloadIntent()) return;
+    const ctx = getResultCtx();
+    if (!ctx) return;
+    const items = $$(ctx.items);
+    if (!items.length) return;
+
+    let officialItem = null, officialName = '', dangerCount = 0;
+
+    // ① 分类（已处理过的跳过，保证幂等）
+    items.forEach(item => {
+      if (item.dataset.csGuard) return;
+      const a = item.querySelector('h2 a[href], h3 a[href], a[href]');
+      let href = effectiveHref(a);
+      // 百度结果 fallback：.c-showurl 直接显示真实域名，无需异步解析
+      if (!href && location.hostname.indexOf('baidu.com') >= 0) {
+        const cite = item.querySelector('.c-showurl, [class*="c-showurl"], cite, .c-color-gray');
+        if (cite) {
+          const m = (cite.textContent || '').match(/([a-z0-9-]+\.[a-z0-9.-]+)/i);
+          if (m) href = m[1];
+        }
+      }
+      if (!href) return;   // 必应 ck/a 或谷歌 /url 待用户重试
+      const name = siteOfficialName(href);
+      if (name) {
+        item.dataset.csGuard = 'official';
+        if (!officialItem) { officialItem = item; officialName = name; }
+      } else if (isDownloadSite(href)) {
+        item.dataset.csGuard = 'danger';
+        dangerCount++;
+      }
+    });
+
+    // ② 加徽章（官方绿标 / 下载站黄标）
+    const flag = (cfg.guardian.pinOfficial || cfg.guardian.warnDownload);
+    if (flag) {
+      items.forEach(item => {
+        const kind = item.dataset.csGuard;
+        if (kind !== 'official' && kind !== 'danger') return;
+        const show = kind === 'official' ? cfg.guardian.pinOfficial : cfg.guardian.warnDownload;
+        if (!show) return;
+        const title = item.querySelector('h2, h3') || item;
+        if (!title || title.querySelector('.cs-guard-badge')) return;
+        const badge = document.createElement('span');
+        badge.className = 'cs-guard-badge';
+        badge.textContent = kind === 'official' ? '官方' : '⚠ 下载站';
+        badge.style.cssText = guardBadgeStyle(kind);
+        title.insertBefore(badge, title.firstChild);
+        if (kind === 'danger') item.style.opacity = '0.6';
+      });
+    }
+
+    // ③ 官网置顶
+    if (officialItem && cfg.guardian.pinOfficial) {
+      const list = document.querySelector(ctx.list.split(',')[0]);
+      if (list && list.firstElementChild !== officialItem) {
+        list.insertBefore(officialItem, list.firstChild);
+      }
+    }
+
+    // ④ 顶部提示条：找到官网 → 绿色确认；找不到但有下载站 → 黄色警告
+    if (officialItem) showGuardBanner('official', officialName);
+    else if (dangerCount > 0) showGuardBanner('warn');
+  }
+
+  /* =====================================================================
    * §8 调度与监听
    * MutationObserver 增量触发（250ms 去抖）+ SPA 路由轻量轮询，
    * 替代旧脚本「每秒全页重扫 600 次」。
@@ -578,6 +787,7 @@
     removedCount = 0;
     try { dispatch(); } catch (e) { console.error('[净搜] 运行异常', e); }
     if (removedCount > 0) console.log('[净搜] 本轮移除 ' + removedCount + ' 个广告/推广节点');
+    try { runGuardian(); } catch (e) { console.error('[净搜] 护航异常', e); }
   }
 
   function startObserver() {
@@ -617,6 +827,12 @@
     kwFilter: '启用关键词屏蔽',
     urlFilter: '启用网址屏蔽',
   };
+  const GUARD_LABELS = {
+    enabled: '护航总开关',
+    pinOfficial: '官网置顶 + 绿色「官方」标',
+    warnDownload: '下载站警示（置灰 + 黄标）',
+    banner: '页面顶部提示条',
+  };
 
   let panelHost = null;
 
@@ -648,6 +864,12 @@
       .map(k => chk(k, FUNC_LABELS[k], !!cfg[k])).join('');
     const filterChk = Object.keys(FILTER_LABELS)
       .map(k => chk('filters.' + k, FILTER_LABELS[k], !!cfg.filters[k])).join('');
+    const guardChk = Object.keys(GUARD_LABELS)
+      .map(k => chk('guardian.' + k, GUARD_LABELS[k], !!cfg.guardian[k])).join('');
+
+    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const officialText = esc(cfg.officialSites.map(o => o.join(' ')).join('\n'));
+    const dlText = esc(cfg.downloadSites.join('\n'));
 
     const ta = (key, rows, placeholder) =>
       '<textarea data-key="' + key + '" rows="' + rows + '" placeholder="' + placeholder + '">' +
@@ -691,6 +913,13 @@
         <h3>功能</h3>
         <div class="row">${funcChk}${filterChk}</div>
 
+        <h3>护航（下载意图搜索时生效）</h3>
+        <div class="row">${guardChk}</div>
+        <h3>官网库（每行：域名 软件名）</h3>
+        <textarea data-key="officialSitesText" rows="4" placeholder="每行一个：域名 软件名（如：weixin.qq.com 微信）">${officialText}</textarea>
+        <h3>下载站警示库（每行一个域名，命中即警示）</h3>
+        <textarea data-key="downloadSitesText" rows="4" placeholder="每行一个下载站域名片段（如：pc6.com）">${dlText}</textarea>
+
         <h3>屏蔽关键词</h3>
         ${ta('keywords', 4, '每行一个关键词，结果标题或摘要包含即被屏蔽（如：装修公司）')}
         <h3>屏蔽网址</h3>
@@ -720,12 +949,25 @@
         for (let i = 0; i < path.length - 1; i++) obj = obj[path[i]];
         obj[path[path.length - 1]] = ck.checked;
       });
-      // textarea（关键词/网址/白名单：按行切分、去空、去重）
+      // textarea（关键词/网址/白名单：按行切分、去空、去重；护航库下方单独解析）
       $$('textarea[data-key]', root).forEach(ta => {
         const key = ta.dataset.key;
+        if (key === 'officialSitesText' || key === 'downloadSitesText') return;
         const arr = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
         cfg[key] = Array.from(new Set(arr));
       });
+      // 护航：官网库 / 下载站库
+      const ofs = root.querySelector('textarea[data-key="officialSitesText"]');
+      if (ofs) {
+        cfg.officialSites = ofs.value.split('\n')
+          .map(line => line.trim().split(/\s+/))
+          .filter(a => a[0] && a[0].indexOf('.') > 0)
+          .map(a => [a[0], a.slice(1).join(' ') || a[0]]);
+      }
+      const ds = root.querySelector('textarea[data-key="downloadSitesText"]');
+      if (ds) {
+        cfg.downloadSites = ds.value.split('\n').map(s => s.trim()).filter(s => s && s.indexOf('.') > 0);
+      }
     };
 
     const toast = (msg) => {
@@ -789,9 +1031,22 @@
   GM_registerMenuCommand('⚙ 净搜 · 设置', openPanel);
   GM_registerMenuCommand('▶ 立即重新净化', () => { runAll(); scheduleRun(600); });
 
-  // 控制台接口：window.__CleanSearch.openPanel() / runAll() / version
+  // 控制台接口：window.__CleanSearch.openPanel() / runAll() / runGuardian() / cfg() / version
   try {
-    window.__CleanSearch = { version: SCRIPT_VERSION, openPanel: openPanel, runAll: runAll };
+    window.__CleanSearch = {
+      version: SCRIPT_VERSION,
+      openPanel: openPanel,
+      runAll: runAll,
+      runGuardian: runGuardian,
+      cfg: () => cfg,
+      probe: {
+        hasDownloadIntent: hasDownloadIntent,
+        getResultCtx: getResultCtx,
+        siteOfficialName: siteOfficialName,
+        isDownloadSite: isDownloadSite,
+        effectiveHref: effectiveHref,
+      },
+    };
   } catch (e) { /* 忽略 */ }
 
   function boot() {
