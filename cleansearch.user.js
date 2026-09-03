@@ -2,7 +2,7 @@
 // @name         净搜 CleanSearch
 // @author       VeT_SHIUAN
 // @namespace    https://github.com/vetshiuan/cleansearch
-// @version      0.2.7
+// @version      0.2.8
 // @updateURL    https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @downloadURL  https://raw.githubusercontent.com/vetshiuan/cleansearch/main/cleansearch.user.js
 // @description  搜索引擎去广告净化：屏蔽百度/谷歌/必应/360 竞价排名广告与推广内容，支持知乎/B站/豆瓣/微博/CSDN 广告过滤，自定义关键词与网址屏蔽，设置面板内置（油猴菜单唤起），无任何外部依赖与推广。
@@ -23,6 +23,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      baidu.com
+// @connect      *.baidu.com
 // @run-at       document-end
 // @noframes
 // @license      MIT
@@ -32,7 +33,33 @@
   'use strict';
 
   /* ===================================================================== *
-   * 净搜 CleanSearch Ver 0.2.7 | 作者：VeT_SHIUAN | License: MIT
+   * 净搜 CleanSearch Ver 0.2.8 | 作者：VeT_SHIUAN | License: MIT
+   *
+   * 0.2.8 修复记录（全量代码审查 + 回归测试套件修复）：
+   *  [P0-1] parseRealUrl 只调用从未定义 —— 百度跳转链接解析每次 onload 抛 ReferenceError，
+   *         finishResolve 永不执行：activeResolve 泄漏（4 次后解析功能彻底停摆）、
+   *         linkWaiters 永不回调、linkCache 永不写入 → 「网址屏蔽」在百度上形同虚设。已实现该函数。
+   *  [P0-2] _isTokenChar 边界取反（!c 使 undefined 被判为「是 token 字符」），
+   *         nameTokenHit 在串首/串尾/整体相等时永远返回 false —— 该函数从未命中过，品牌名兜底判定全废。
+   *  [P0-3] 回归测试套件引用 probe.brandNameHit / nameTokenHit / parseRealUrl / refreshAdStyleState，
+   *         脚本一个都没暴露 → 测试在 D 段崩溃，F/G/H 段从未执行。已补全 probe API。
+   *  [P1-1] 护航提示条第二轮必消失：①分类跳过已定性项，导致 officialItem/dangerCount 第二轮归零，
+   *         ④立刻 showGuardBanner(null) 删掉刚插入的横幅 —— 0.2.7 主打功能实为「闪现即消失」。
+   *  [P1-2] 官网置顶把横幅挤到第二位：insertBefore(item, list.firstChild) 插到横幅之前。
+   *  [P1-3] 横幅自身是 #content_left > div，被当成搜索结果参与分类，会拿到灰标「官方?」并插入徽章。
+   *  [P1-4] 关闭护航 / 官网置顶 / 下载站警示 / 总开关 / 白名单后，已插入的徽章、置灰、标记全部残留。
+   *  [P1-5] isDownloadSite 用「域名+正文」混合 haystack：正文提到 pc6.com 就把官网误判成下载站。
+   *         改为域名优先（域名命中官网库时不看正文），正文仅作无域名时的兜底。
+   *  [P1-6] 「品牌词 + 陌生域名」未判 danger：仿冒站（标题写「微信官方下载」、域名是陌生小站）漏网。
+   *         增加「域名陌生 + 品牌名 + 下载诱导词 → danger」，并用诱导词约束避免误伤百科/资讯页。
+   *  [P1-7] 谷歌嵌套 div[data-hveid] 重复分类，同一结果被打上多个徽章。
+   *  [P1-8] GM_xmlhttpRequest 同步抛错 / onload 与 ontimeout 双触发 → activeResolve 泄漏或变负。
+   *  [P2-1] cleanSo360 的 hasAdBadge 未受 cfg.badgeText 开关控制，关闭角标识别在 360 上无效。
+   *  [P2-2] 知乎弹窗关闭判断取反：找不到 modal 时（!modal）反而强制点击关闭按钮。
+   *  [P2-3] migrateOldConfig 无异常保护，GM_getValue 抛错会导致整个脚本不启动。
+   *  [P2-4] scheduleRun 名为防抖实为「丢弃」，更小的 delay 请求（如解析完成后的 150ms）被完全吞掉。
+   *  [P2-5] 导入配置无类型净化：officialSites 若为字符串数组，domainHit 会用单字符匹配 → 全站误杀。
+   *  [P2-6] 导出配置 revokeObjectURL 紧随 click()，下载可能被取消；a 元素未挂载。
    *
    * 0.2.7 修复记录（护航提示条状态机自检）：
    *  [Self1] 顶部提示条跨查询残留：从下载查询切到普通查询/关闭护航后，旧横幅仍挂在结果区 → runGuardian 出口统一清理
@@ -64,7 +91,7 @@
    * §7.5 护航模块  §8 调度与监听  §9 内置设置面板
    * ===================================================================== */
 
-  const SCRIPT_VERSION = "0.2.7";
+  const SCRIPT_VERSION = "0.2.8";
   const CONFIG_KEY = 'cs_config';
   const MIGRATED_KEY = 'cs_migrated_v0';
 
@@ -165,13 +192,68 @@
   }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
+  /* --------------------------------------------------------------------- *
+   * 【P2-5】配置净化：导入/读取的配置可能来自旧版本、手改文件或第三方，
+   * 类型不可信。不做净化时 officialSites 若是字符串数组，domainHit 会拿
+   * 单字符去匹配任意域名 → 全站结果被误判官网/下载站。
+   * ------------------------------------------------------------------- */
+  function normalizeConfig(raw) {
+    // 非对象（字符串 / 数字 / 数组）一律视为无配置：否则 deepMerge 会把它原样返回，
+    // 后续对原始值赋属性会在 'use strict' 下抛 TypeError
+    if (raw !== null && (typeof raw !== 'object' || Array.isArray(raw))) raw = null;
+    const d = clone(DEFAULT_CONFIG);
+    const out = deepMerge(d, raw);
+    const isBool = (v) => typeof v === 'boolean';
+    const boolOf = (v, dv) => (isBool(v) ? v : dv);
+    const strArr = (v) => (Array.isArray(v)
+      ? Array.from(new Set(v.filter(x => typeof x === 'string').map(s => s.trim()).filter(Boolean)))
+      : null);
+
+    out.enabled = boolOf(out.enabled, true);
+    out.badgeText = boolOf(out.badgeText, true);
+    out.resolveLinks = boolOf(out.resolveLinks, true);
+    out.hotList = boolOf(out.hotList, true);
+
+    const sites = {};
+    for (const k of Object.keys(d.sites)) sites[k] = boolOf(out.sites && out.sites[k], d.sites[k]);
+    out.sites = sites;
+
+    const filters = {};
+    for (const k of Object.keys(d.filters)) filters[k] = boolOf(out.filters && out.filters[k], d.filters[k]);
+    out.filters = filters;
+
+    const guardian = {};
+    for (const k of Object.keys(d.guardian)) guardian[k] = boolOf(out.guardian && out.guardian[k], d.guardian[k]);
+    out.guardian = guardian;
+
+    for (const k of ['keywords', 'urls', 'whitelist', 'downloadSites']) {
+      const a = strArr(out[k]);
+      out[k] = a === null ? d[k] : a;   // 类型错误 → 回落默认（用户主动清空时是 []，保留空）
+    }
+
+    if (Array.isArray(out.officialSites)) {
+      // 允许被清空（空数组），但每一项必须是 [域名, 名称] 二元组且域名含 "."
+      const src = out.officialSites;
+      const ok = src
+        .filter(o => Array.isArray(o) && typeof o[0] === 'string' && o[0].indexOf('.') > 0)
+        .map(o => {
+          const dom = String(o[0]).trim();
+          const nm = String(o[1] === undefined || o[1] === null ? dom : o[1]).trim();
+          return [dom, nm || dom];
+        });
+      // 有内容却一项都不合法（例如被写成了字符串数组）→ 视为损坏，回落内置库；
+      // 空数组视为用户主动清空，予以保留
+      out.officialSites = (src.length && !ok.length) ? d.officialSites : ok;
+    } else {
+      out.officialSites = d.officialSites;   // 类型损坏 → 回落内置官网库
+    }
+    return out;
+  }
+
   function loadConfig() {
     let saved = null;
     try { saved = GM_getValue(CONFIG_KEY); } catch (e) { saved = null; }
-    if (saved && typeof saved === 'object') {
-      return deepMerge(clone(DEFAULT_CONFIG), saved);
-    }
-    return clone(DEFAULT_CONFIG);
+    return normalizeConfig(saved);
   }
   let cfg = loadConfig();
   function saveConfig() {
@@ -182,23 +264,33 @@
    * §2 旧脚本数据迁移
    * ===================================================================== */
   function migrateOldConfig() {
-    if (GM_getValue(MIGRATED_KEY)) return;
+    // 【P2-3】整体 try/catch：本函数在 boot 最前面执行，一旦抛出（存储被禁用 / 配额 /
+    // 旧脚本写入了不可解析的数据），后面的 runAll 与 startObserver 都不会执行 —— 脚本彻底不工作。
     try {
-      const old = GM_getValue('allconfig');
-      if (old && typeof old === 'object') {
-        const pick = (arr) => Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()).map(s => s.trim()) : [];
-        if (!cfg.keywords.length) cfg.keywords = pick(old.pingbikw);
-        if (!cfg.urls.length) cfg.urls = pick(old.pingbiurl);
-        if (!cfg.whitelist.length) cfg.whitelist = pick(old.urlwhite);
-      }
-    } catch (e) { /* 旧数据不存在，忽略 */ }
-    GM_setValue(MIGRATED_KEY, 1);
-    saveConfig();
+      if (GM_getValue(MIGRATED_KEY)) return;
+      try {
+        const old = GM_getValue('allconfig');
+        if (old && typeof old === 'object') {
+          const pick = (arr) => Array.isArray(arr) ? arr.filter(x => typeof x === 'string' && x.trim()).map(s => s.trim()) : [];
+          if (!cfg.keywords.length) cfg.keywords = pick(old.pingbikw);
+          if (!cfg.urls.length) cfg.urls = pick(old.pingbiurl);
+          if (!cfg.whitelist.length) cfg.whitelist = pick(old.urlwhite);
+        }
+      } catch (e) { /* 旧数据不存在，忽略 */ }
+      GM_setValue(MIGRATED_KEY, 1);
+      saveConfig();
+    } catch (e) {
+      try { console.warn('[净搜] 旧配置迁移跳过', e); } catch (e2) { /* 忽略 */ }
+    }
   }
 
   /* ===================================================================== *
    * §3 通用工具
    * ===================================================================== */
+  // 脚本自注入节点的标识（提示条 / 徽章），用于把「自己注入的东西」从搜索结果里排除掉
+  const GUARD_BANNER_ID = 'cs-guard-banner';
+  const GUARD_BADGE_CLS = 'cs-guard-badge';
+
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
   function textOf(el) { return (el && el.textContent || '').trim(); }
   function isLeaf(el) { return el.children.length === 0; }
@@ -323,10 +415,54 @@
   }
 
   function finishResolve(href, real) {
+    // 【P0-1 / P1-8】幂等：onload 与 ontimeout 在某些引擎下会双触发，
+    // 不去重会让 activeResolve 变成负数，进而永久放行超过 MAX_CONCURRENT 的请求。
+    if (linkCache.has(href)) return;
     linkCache.set(href, real || '');
-    activeResolve--;
+    if (activeResolve > 0) activeResolve--;
     flushWaiters(href, real || '');
     pumpResolve();
+  }
+
+  function decodeEntities(s) {
+    return String(s)
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)));
+  }
+
+  /* --------------------------------------------------------------------- *
+   * 【P0-1】parseRealUrl —— 0.2.7 及之前只调用、从未定义。
+   * 后果链：onload 抛 ReferenceError → finishResolve 不执行 → activeResolve 泄漏
+   * （4 次后解析彻底停摆）、linkWaiters 永不回调、linkCache 永不写入 →
+   * 「网址屏蔽」在百度搜索结果上完全失效。
+   * 用途：手动重定向模式下从跳转中间页里抠出真实地址。
+   * ------------------------------------------------------------------- */
+  function parseRealUrl(html) {
+    if (!html) return '';
+    const s = String(html);
+    try {
+      // ① <meta http-equiv="refresh" content="0;url=...">
+      let m = s.match(/<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*>/i);
+      if (m) {
+        const c = m[0].match(/url\s*=\s*["']?([^"'\s>;]+)/i);
+        if (c) return decodeEntities(c[1]);
+      }
+      // ② window.location.replace(...) / .assign(...) / .href = ...
+      m = s.match(/window\.location(?:\.href\s*=|\s*=\s*|\.replace\s*\(|\.assign\s*\(|\s*\[\s*["']href["']\s*\]\s*=)\s*["']([^"']+)["']/i);
+      if (m) return decodeEntities(m[1]);
+      // ③ location.href = ... / top.location = ...
+      m = s.match(/(?:^|[^.\w])(?:top\.)?location(?:\.href)?\s*=\s*["'](https?:\/\/[^"']+)["']/i);
+      if (m) return decodeEntities(m[1]);
+      // ④ 兜底：仅在确实是「跳转中间页」时才抓页面里第一个 http(s) 链接，
+      //    避免在正常结果页里抓到随机外链
+      if (s.length < 20000 && /location|refresh|redirect|跳转|正在跳转|安全验证/i.test(s)) {
+        m = s.match(/["'(](https?:\/\/[^"'\s<>)]{6,})["')]/);
+        if (m) return decodeEntities(m[1]);
+      }
+    } catch (e) { /* 忽略解析异常 */ }
+    return '';
   }
 
   function pumpResolve() {
@@ -334,22 +470,34 @@
       const href = resolveQueue.shift();
       if (linkCache.has(href)) { flushWaiters(href, linkCache.get(href)); continue; }
       activeResolve++;
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url: href,
-        timeout: 4000,
-        redirect: 'manual',
-        onload: (res) => {
-          let real = '';
-          const hdrs = res.responseHeaders || '';
-          const lm = hdrs.match(/(?:^|\r?\n)[Ll]ocation:\s*(\S+)/);
-          if (lm) real = lm[1];
-          if (!real) real = parseRealUrl(res.responseText);
-          finishResolve(href, real);
-        },
-        onerror: () => finishResolve(href, ''),
-        ontimeout: () => finishResolve(href, ''),
-      });
+      let started = false;
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: href,
+          timeout: 4000,
+          redirect: 'manual',
+          onload: (res) => {
+            let real = '';
+            try {
+              // onload 内任何异常都会吞掉 finishResolve（P0-1 的根因），这里统一兜住
+              const hdrs = (res && res.responseHeaders) || '';
+              const lm = String(hdrs).match(/(?:^|\r?\n)[Ll]ocation:\s*(\S+)/);
+              if (lm) real = lm[1];
+              if (!real && res && res.finalUrl && res.finalUrl !== href) real = res.finalUrl;
+              if (!real) real = parseRealUrl(res && res.responseText);
+            } catch (e) { real = ''; }
+            finishResolve(href, real);
+          },
+          onerror: () => finishResolve(href, ''),
+          ontimeout: () => finishResolve(href, ''),
+          onabort: () => finishResolve(href, ''),
+        });
+        started = true;
+      } catch (e) {
+        // 【P1-8】同步抛出（URL 非法 / GM API 不可用）时也必须归还并发额度，否则队列永久卡死
+        if (!started) finishResolve(href, '');
+      }
     }
   }
 
@@ -405,7 +553,10 @@
 
     const seen = new Set();
     // 【Fix10】.cos-row 限定在 #content_left，避免误伤非结果区
-    const items = $$('#content_left > div, #content_left [data-srcid], #content_left > .result, #content_left .cos-row');
+    // 【P1-3】排除脚本自己注入的提示条：它是 #content_left 的直接子 div，
+    // 会被当成一条搜索结果，用户屏蔽词含「下载/官方」时提示条会被自己删掉
+    const items = $$('#content_left > div, #content_left [data-srcid], #content_left > .result, #content_left .cos-row')
+      .filter(el => el.id !== GUARD_BANNER_ID);
     items.forEach(item => {
       if (seen.has(item)) return;
       seen.add(item);
@@ -514,7 +665,9 @@
       '#__lawnImageContainer', 'li[data-from="ad"]', '.g-ad-card',
     ]);
     $$('.res-list, #res_news_flow li').forEach(li => {
-      if (hasAdBadge(li)) { li.remove(); removedCount++; return; }
+      // 【P2-1】原版直接调 hasAdBadge，绕过了 cfg.badgeText 开关：
+      // 用户在面板里关掉「识别广告角标文本」后，360 上仍然照删不误。
+      if (cfg.badgeText && hasAdBadge(li)) { li.remove(); removedCount++; return; }
       if (hitKeyword(textOf(li))) { li.remove(); removedCount++; }
     });
   }
@@ -536,7 +689,9 @@
     if (closeBtn) {
       const modal = closeBtn.closest('.Modal, [class*="Modal"]');
       const t = modal ? (modal.textContent || '') : '';
-      if (!modal || /登录|注册|扫码|下载App|打开App/.test(t)) closeBtn.click();
+      // 【P2-2】原判断 `!modal || ...` 逻辑取反：找不到所属弹窗时反而无条件点击关闭，
+      // 与「确认是登录/注册弹窗才关闭」的意图相反，可能误关退出确认等无关弹窗。
+      if (modal && /登录|注册|扫码|下载App|打开App|立即登录|短信登录|密码登录/i.test(t)) closeBtn.click();
     }
   }
 
@@ -589,13 +744,20 @@
     return true;
   }
 
+  // 当前搜索词（已解码、小写）；拿不到时返回空串
+  function currentQuery() {
+    try {
+      const m = location.search.match(/[?&](?:wd|word|q|query|kw)=([^&]*)/);
+      if (!m || !m[1]) return '';
+      let q = m[1];
+      try { q = decodeURIComponent(String(q).replace(/\+/g, ' ')); }
+      catch (e) { /* 【Fix6b】畸形编码就用原串，不再抛异常 */ }
+      return String(q).toLowerCase();
+    } catch (e) { return ''; }
+  }
+
   function hasDownloadIntent() {
-    const m = location.search.match(/[?&](?:wd|word|q|query|kw)=([^&]*)/);
-    if (!m || !m[1]) return false;
-    let q = m[1];
-    try { q = decodeURIComponent(String(q).replace(/\+/g, ' ')); }
-    catch (e) { /* 【Fix6b】畸形编码就用原串，不再抛异常 */ }
-    q = String(q).toLowerCase();
+    const q = currentQuery();
     if (!q) return false;
     if (DL_NEWS_RE.test(q)) return false;
     if (DL_STRONG_WORDS.some(w => q.indexOf(w) >= 0)) return true;
@@ -688,7 +850,11 @@
 
   // 品牌名 token 边界：前后不能是 ASCII 字母数字连字符 或 汉字 CJK
   // 例："豆包"在"我爱豆包子"中前后是汉字 → 不算独立 token → 避免误报
-  const _isTokenChar = (c) => !c || /[\w一-鿿]/.test(c);
+  // 【P0-2】原实现 `!c || ...` 把 undefined（串首/串尾）当成「是 token 字符」，
+  // 等价于「边界永远不满足」—— nameTokenHit 在任何位置都返回 false，函数从未命中过。
+  // 正确语义：越界（undefined）应视为「不是 token 字符」，即允许匹配。
+  const CJK_RE = /[\w一-鿿]/;
+  const _isTokenChar = (c) => !!c && CJK_RE.test(c);
   function nameTokenHit(hay, name) {
     if (!hay || !name) return false;
     const h = String(hay), n = String(name);
@@ -701,6 +867,20 @@
     return false;
   }
 
+  /* --------------------------------------------------------------------- *
+   * 【P1-5】从链接里取出纯域名（小写、去端口、去 userinfo、去路径）。
+   * 不依赖 new URL()：某些页面/环境下 URL 构造器被站点脚本改写过，
+   * 这里用正则保证零依赖且不会因为非法输入抛异常。
+   * ------------------------------------------------------------------- */
+  function domainOf(href) {
+    if (!href) return '';
+    let s = String(href).trim();
+    if (!s) return '';
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'http://' + s;   // 裸域名（来自 c-showurl）
+    const m = s.match(/^[a-z][a-z0-9+.-]*:\/\/(?:[^@\/?#]*@)?([^\/?#:]+)/i);
+    return m ? String(m[1]).toLowerCase() : '';
+  }
+
   // 【Issue1】"官方"判定优先以真实域名为准：只有域名命中官网库才算 official。
   // 品牌名不再参与官方判定，只作为域名无证据时的"候选"兜底，防止下载站标题蹭品牌词获得绿标置顶。
   function siteOfficialName(hay) {
@@ -710,16 +890,55 @@
     return null;
   }
 
-  // 品牌名 token 兜底：百度新版结果卡片可能只展示品牌名、拿不到可解析域名时使用
+  /* --------------------------------------------------------------------- *
+   * 【P0-2 配套】宽松品牌匹配。
+   * nameTokenHit 的严格边界在中文里过于苛刻："微信官方下载" 里 "微信" 后面紧跟
+   * "官"（CJK），严格规则判为不命中 —— 而这恰恰是仿冒站最典型的标题写法。
+   * 这里补充一条：品牌名位于文本开头（去掉常见前置标点后）同样算命中。
+   * "我爱豆包子 / 豆包" 依旧不命中（豆包不在串首）。
+   * ------------------------------------------------------------------- */
+  function brandLooseHit(hay, name) {
+    if (!hay || !name) return false;
+    if (nameTokenHit(hay, name)) return true;
+    const h = String(hay).replace(/^[\s　「【（《"'`·、,，.。:：]+/, '');
+    return h.toLowerCase().indexOf(String(name).toLowerCase()) === 0;
+  }
+
+  // 品牌名兜底：百度新版结果卡片可能只展示品牌名、拿不到可解析域名时使用
   function officialNameCandidate(hay) {
     for (const o of cfg.officialSites) {
-      if (nameTokenHit(hay, o[1])) return o[1];
+      if (brandLooseHit(hay, o[1])) return o[1];
     }
     return null;
   }
 
   function isDownloadSite(hay) {
     return cfg.downloadSites.some(d => domainHit(hay, d));
+  }
+
+  // 【P1-6】下载诱导词：域名陌生但结果文案在诱导下载时，判为危险站点。
+  // 必须用诱导词做约束，否则「微信 百度百科」这类资讯页也会被误标成下载站。
+  const DL_LURE_RE = /下载|安装包|官方版|绿色版|破解|注册机|激活|特别版|最新版|电脑版|客户端|免费版|中文版|setup|\.exe|\.zip|\.rar|\.msi/i;
+
+  /* --------------------------------------------------------------------- *
+   * 【P1-4】护航痕迹清理：徽章 / 置灰 / 分类标记 / 顶部横幅。
+   * 关闭护航、关闭置顶或警示开关、关闭总开关、命中白名单时都必须调用，
+   * 否则上一轮注入的 DOM 会永久留在页面上（原版完全没有清理路径）。
+   * ------------------------------------------------------------------- */
+  function resetGuardianArtifacts() {
+    const safeRemove = (el) => { try { el.remove(); } catch (e) { /* 忽略 */ } };
+    try {
+      $$('.' + GUARD_BADGE_CLS).forEach(safeRemove);
+      const banner = document.getElementById(GUARD_BANNER_ID);
+      if (banner) safeRemove(banner);
+      $$('[data-cs-guard]').forEach(el => {
+        try {
+          el.removeAttribute('data-cs-guard');
+          el.removeAttribute('data-cs-guard-name');
+          if (el.dataset.csGuardDimmed) { el.style.opacity = ''; delete el.dataset.csGuardDimmed; }
+        } catch (e) { /* 忽略 */ }
+      });
+    } catch (e) { /* 忽略 */ }
   }
 
   function guardBadgeStyle(kind) {
@@ -753,21 +972,57 @@
     if (!exist) list.insertBefore(banner, list.firstChild);
   }
 
+  // 单条结果的分类判定（纯逻辑，便于回归测试）
+  // 【P1-5】域名优先：拿到真实域名时只看域名，正文里提到 "pc6.com" 之类不再劫持判定
+  // 【P1-6】域名陌生 + 品牌名 + 下载诱导词 → danger（防仿冒站），无诱导词只降级为 candidate
+  function classifyItem(href, text, query) {
+    const host = domainOf(href);
+    const body = String(text || '').slice(0, 800);
+    const q = String(query || '').toLowerCase();
+    if (host) {
+      if (isDownloadSite(host)) return { kind: 'danger', name: '' };
+      const nm = siteOfficialName(host);
+      if (nm) {
+        // 域名确实是官网，还要确认它与本次搜索的软件相关：
+        // 否则搜「微信下载」时，一条 zhihu.com 的结果会因为「知乎」在官网库里
+        // 而被判成官方站点并置顶（误伤）。搜索词是最好的相关性证据。
+        const related = !q || brandLooseHit(q, nm);
+        return related ? { kind: 'official', name: nm } : { kind: 'candidate', name: nm };
+      }
+      if (isDownloadSite(body)) return { kind: 'danger', name: '' };
+      const brand = officialNameCandidate(body);
+      if (brand && DL_LURE_RE.test(body)) return { kind: 'danger', name: brand };
+      if (brand) return { kind: 'candidate', name: brand };
+      return { kind: '', name: '' };
+    }
+    // 拿不到域名（百度新版卡片 / 跳转链异步解析中）：只用文本兜底，不作官方判定
+    if (isDownloadSite(body)) return { kind: 'danger', name: '' };
+    const brand2 = officialNameCandidate(body);
+    if (brand2 && DL_LURE_RE.test(body)) return { kind: 'danger', name: brand2 };
+    if (brand2) return { kind: 'candidate', name: brand2 };
+    return { kind: '', name: '' };
+  }
+
   function runGuardian() {
-    // 护航关闭 / 白名单 / 非下载意图：一律清掉可能残留的顶部提示条
-    if (!cfg.guardian.enabled || inWhitelist() || !hasDownloadIntent()) {
-      showGuardBanner(null);
+    // 护航关闭 / 白名单 / 非下载意图：清掉全部护航痕迹（横幅 + 徽章 + 置灰 + 标记）
+    if (!cfg.enabled || !cfg.guardian.enabled || inWhitelist() || !hasDownloadIntent()) {
+      resetGuardianArtifacts();
       return;
     }
     const ctx = getResultCtx();
-    if (!ctx) { showGuardBanner(null); return; }
-    const items = $$(ctx.items);
-    if (!items.length) { showGuardBanner(null); return; }
-
-    let officialItem = null, officialName = '', dangerCount = 0;
+    if (!ctx) { resetGuardianArtifacts(); return; }
+    // 【P1-3】横幅自己是结果容器的直接子 div，会被选择器当成一条搜索结果：
+    // 既可能被打上「官方?」灰标，也可能在关键词屏蔽里被误删。这里显式排除脚本自注入节点。
+    const items = $$(ctx.items).filter(el => el.id !== GUARD_BANNER_ID);
+    if (!items.length) { resetGuardianArtifacts(); return; }
 
     // ① 分类（official/danger 已定性则跳过；candidate 允许解析出真实域名后升级重判）
     items.forEach(item => {
+      // 【P1-7】谷歌的 div[data-hveid] 会层层嵌套，外层已定性时内层不再重复分类/打标
+      try {
+        const owner = item.closest && item.closest('[data-cs-guard]');
+        if (owner && owner !== item) return;
+      } catch (e) { /* 忽略 */ }
       if (item.dataset.csGuard === 'official' || item.dataset.csGuard === 'danger') return;
       const a = item.querySelector('h2 a[href], h3 a[href], a[href]');
       let href = effectiveHref(a);
@@ -778,61 +1033,87 @@
           if (m) href = m[1];
         }
       }
-      const haystack = (href || '') + ' ' + (item.textContent || '').slice(0, 800);
-      // 【Issue1】互斥三态：danger(下载站域名) > official(官网域名) > candidate(仅品牌名出现)
-      if (isDownloadSite(haystack)) {
-        item.dataset.csGuard = 'danger';
-        dangerCount++;
-        return;
+      let kind = '', name = '';
+      try {
+        const r = classifyItem(href, item.textContent, currentQuery());
+        kind = r.kind; name = r.name;
+      } catch (e) { kind = ''; }
+      if (kind) {
+        item.dataset.csGuard = kind;
+        item.dataset.csGuardName = name || '';
+      } else if (item.dataset.csGuard) {
+        delete item.dataset.csGuard;
+        delete item.dataset.csGuardName;
       }
-      const name = siteOfficialName(haystack);
-      if (name) {
-        item.dataset.csGuard = 'official';
-        if (!officialItem) { officialItem = item; officialName = name; }
-        return;
-      }
-      // 品牌名仅兜底为"候选"（灰标"官方?"提示核实）：不置顶、不给绿标；
-      // 等真实域名解析/文本中露出域名后，下轮可升级为 official 或 danger
-      if (officialNameCandidate(haystack)) item.dataset.csGuard = 'candidate';
     });
 
     // ② 加徽章（官方绿标 / 下载站黄标）
-    const flag = (cfg.guardian.pinOfficial || cfg.guardian.warnDownload);
-    if (flag) {
-      items.forEach(item => {
-        const kind = item.dataset.csGuard;
-        if (kind !== 'official' && kind !== 'danger' && kind !== 'candidate') return;
-        const show = kind === 'danger'
-          ? cfg.guardian.warnDownload
-          : cfg.guardian.pinOfficial; // official/candidate 均跟随「官网置顶+绿标」开关
-        if (!show) return;
-        const title = item.querySelector('h2, h3') || item;
-        if (!title) return;
-        const oldBadge = title.querySelector('.cs-guard-badge');
-        if (oldBadge) {
-          if (oldBadge.dataset.kind === kind) return;
-          oldBadge.remove(); // 分类升级/变更（candidate → official/danger）时替换旧徽章
-        }
-        const badge = document.createElement('span');
-        badge.className = 'cs-guard-badge';
-        badge.dataset.kind = kind;
-        badge.textContent = kind === 'official' ? '官方'
-          : (kind === 'danger' ? '⚠ 下载站' : '官方?');
-        badge.style.cssText = guardBadgeStyle(kind);
-        title.insertBefore(badge, title.firstChild);
-        if (kind === 'danger') item.style.opacity = '0.6';
-      });
-    }
+    // 【P1-4】开关关闭时主动清理上一轮残留的徽章与置灰，而不是简单地 return
+    items.forEach(item => {
+      const kind = item.dataset.csGuard || '';
+      const title = (item.querySelector && item.querySelector('h2, h3')) || item;
+      const oldBadge = title && title.querySelector ? title.querySelector('.' + GUARD_BADGE_CLS) : null;
+      const show = kind === 'danger'
+        ? cfg.guardian.warnDownload
+        : (kind === 'official' || kind === 'candidate') ? cfg.guardian.pinOfficial : false;
 
-    // ③ 官网置顶
+      if (!show) {
+        if (oldBadge) { try { oldBadge.remove(); } catch (e) { /* 忽略 */ } }
+        if (item.dataset.csGuardDimmed) { item.style.opacity = ''; delete item.dataset.csGuardDimmed; }
+        return;
+      }
+      if (!title || !title.insertBefore) return;
+      if (oldBadge) {
+        if (oldBadge.dataset.kind === kind) return;
+        try { oldBadge.remove(); } catch (e) { /* 忽略 */ }
+      }
+      let badge = null;
+      try { badge = document.createElement('span'); } catch (e) { return; }
+      badge.className = GUARD_BADGE_CLS;
+      badge.dataset.kind = kind;
+      badge.textContent = kind === 'official' ? '官方'
+        : (kind === 'danger' ? '⚠ 下载站' : '官方?');
+      badge.style.cssText = guardBadgeStyle(kind);
+      title.insertBefore(badge, title.firstChild);
+      if (kind === 'danger') {
+        item.style.opacity = '0.6';
+        item.dataset.csGuardDimmed = '1';
+      } else if (item.dataset.csGuardDimmed) {
+        item.style.opacity = '';
+        delete item.dataset.csGuardDimmed;
+      }
+    });
+
+    /* ------------------------------------------------------------------- *
+     * ③ 统计（【P1-1】关键修复）
+     * 原实现在「①分类」里统计 officialItem / dangerCount，而已定性的项第二
+     * 轮会被跳过 → 计数归零 → ④ 立刻把刚插入的横幅删掉。表现就是横幅闪现
+     * 一下就消失，0.2.7 的提示条功能实际上从未稳定显示过。
+     * 改为遍历全部结果的最终状态重新统计，结果才与页面上看到的一致。
+     * ----------------------------------------------------------------- */
+    let officialItem = null, officialName = '', dangerCount = 0;
+    items.forEach(item => {
+      const k = item.dataset.csGuard;
+      if (k === 'danger') { dangerCount++; return; }
+      if (k === 'official' && !officialItem) {
+        officialItem = item;
+        officialName = item.dataset.csGuardName || '';
+      }
+    });
+
+    // ④ 官网置顶（【P1-2】不要把提示条挤到第二位：锚点跳过横幅本身）
     if (officialItem && cfg.guardian.pinOfficial) {
       const list = getListEl(ctx);
       if (list && list.firstElementChild !== officialItem) {
-        list.insertBefore(officialItem, list.firstChild);
+        let anchor = list.firstElementChild;
+        while (anchor && anchor.id === GUARD_BANNER_ID) anchor = anchor.nextElementSibling;
+        if (anchor !== officialItem) {
+          try { list.insertBefore(officialItem, anchor); } catch (e) { /* 忽略 */ }
+        }
       }
     }
 
-    // ④ 顶部提示条（official/warn 可互相替换；两者皆无时清掉残留横幅）
+    // ⑤ 顶部提示条（official/warn 可互相替换；两者皆无时清掉残留横幅）
     if (officialItem) showGuardBanner('official', officialName);
     else if (dangerCount > 0) showGuardBanner('warn');
     else showGuardBanner(null);
@@ -842,13 +1123,25 @@
    * §8 调度与监听
    * ===================================================================== */
   let debounceTimer = null;
+  let pendingDelay = 0;
 
+  /* 【P2-4】原实现 `if (debounceTimer) return;` 名为防抖、实为「丢弃」：
+   * 已排队时任何新请求都被静默吞掉，包括更紧急的（解析完成后的 150ms 重扫）。
+   * 改成：已排队时若新请求更快（delay 更小），重置为更小的延时；否则保持现有排队
+   * （不会被吞，最慢也会按原计划执行一次）。 */
   function scheduleRun(delay) {
-    if (debounceTimer) return;
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null;
-      runAll();
-    }, delay || 250);
+    const d = delay || 250;
+    const fire = () => { debounceTimer = null; pendingDelay = 0; runAll(); };
+    if (debounceTimer) {
+      if (d < pendingDelay) {
+        clearTimeout(debounceTimer);
+        pendingDelay = d;
+        debounceTimer = setTimeout(fire, d);
+      }
+      return;
+    }
+    pendingDelay = d;
+    debounceTimer = setTimeout(fire, d);
   }
 
   function dispatch() {
@@ -883,7 +1176,12 @@
   let spaTimer = null;   // 【Fix1】SPA 轮询定时器句柄
 
   function runAll() {
-    if (!cfg.enabled || inWhitelist()) return;
+    // 【P1-4】关闭/白名单时同样要撤掉已注入的样式与护航痕迹，否则「关闭」在当前页面不生效
+    if (!cfg.enabled || inWhitelist()) {
+      syncAdCSS();
+      resetGuardianArtifacts();
+      return;
+    }
     removedCount = 0;
     try { dispatch(); } catch (e) { console.error('[净搜] 运行异常', e); }
     if (removedCount > 0) console.log('[净搜] 本轮移除 ' + removedCount + ' 个广告/推广节点');
@@ -909,7 +1207,7 @@
   function stopObserver() {
     if (observer) { observer.disconnect(); observer = null; }
     if (spaTimer) { clearInterval(spaTimer); spaTimer = null; }        // 【Fix1】
-    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; pendingDelay = 0; }
   }
 
   /* ===================================================================== *
@@ -937,6 +1235,7 @@
 
   function openPanel() {
     if (panelHost) { closePanel(); return; }
+    if (!document.body) return;      // 【P2-3 配套】document-end 之前被唤起时不炸
     stopObserver();
     panelHost = document.createElement('div');
     panelHost.id = 'cs-panel-host';
@@ -955,6 +1254,9 @@
     if (cfg.enabled && !inWhitelist()) {
       startObserver();
       scheduleRun(80);
+    } else {
+      // 【P1-4】关闭状态：清掉本轮之前注入的护航徽章/置灰/横幅
+      resetGuardianArtifacts();
     }
   }
 
@@ -1077,12 +1379,20 @@
     });
     root.getElementById('cs-export').addEventListener('click', () => {
       collect();
-      const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'cleansearch-config.json';
-      a.click();
-      URL.revokeObjectURL(a.href);
+      try {
+        const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'cleansearch-config.json';
+        a.style.display = 'none';
+        root.appendChild(a);                       // 【P2-6】部分浏览器要求 a 在文档里才会触发下载
+        a.click();
+        // 【P2-6】立刻 revoke 会让下载被取消，延后一帧释放
+        setTimeout(() => {
+          try { URL.revokeObjectURL(a.href); } catch (e) { /* 忽略 */ }
+          try { a.remove(); } catch (e) { /* 忽略 */ }
+        }, 0);
+      } catch (e) { toast('导出失败：' + (e && e.message ? e.message : e)); }
     });
     root.getElementById('cs-import').addEventListener('click', () => root.getElementById('cs-file').click());
     root.getElementById('cs-file').addEventListener('change', e => {
@@ -1092,7 +1402,9 @@
       reader.onload = () => {
         try {
           const data = JSON.parse(String(reader.result));
-          cfg = deepMerge(clone(DEFAULT_CONFIG), data);
+          // 【P2-5】导入来源不可信，必须走配置净化，否则类型错误会导致大面积误杀
+          if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('bad shape');
+          cfg = normalizeConfig(data);
           saveConfig();
           toast('导入成功');
           root.innerHTML = buildPanelHTML();
@@ -1120,11 +1432,24 @@
       cfg: () => cfg,
       probe: {
         hasDownloadIntent: hasDownloadIntent,
+        currentQuery: currentQuery,
         getResultCtx: getResultCtx,
         siteOfficialName: siteOfficialName,
+        officialNameCandidate: officialNameCandidate,
+        // 【P0-3】回归测试套件引用的 4 个 API 此前一个都没暴露，测试在 D 段即崩溃
+        brandNameHit: officialNameCandidate,
+        nameTokenHit: nameTokenHit,
+        brandLooseHit: brandLooseHit,
+        parseRealUrl: parseRealUrl,
+        refreshAdStyleState: syncAdCSS,
         isDownloadSite: isDownloadSite,
         effectiveHref: effectiveHref,
         decodeBingU: decodeBingU,
+        domainHit: domainHit,
+        domainOf: domainOf,
+        classifyItem: classifyItem,
+        normalizeConfig: normalizeConfig,
+        resetGuardianArtifacts: resetGuardianArtifacts,
       },
     };
     if (typeof unsafeWindow !== 'undefined') unsafeWindow.__CleanSearch = api;

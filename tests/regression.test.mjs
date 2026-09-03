@@ -285,6 +285,234 @@ section('H. effectiveHref（Fix5）');
   check('必应普通直链原样返回', api.probe.effectiveHref({ href: 'https://example.com/direct2' }) === 'https://example.com/direct2');
 }
 
+/* ===================================================================== *
+ * I. 顶部提示条第二轮不消失（P1-1）+ 置顶后横幅保持首位（P1-2）
+ * ---------------------------------------------------------------------
+ * 0.2.7 的真实行为：①分类阶段跳过已定性项 → officialItem / dangerCount 第二轮归零
+ * → ④ 立刻把刚插入的横幅删掉。表现为横幅闪现一下就消失。
+ * ================================================================== */
+section('I. 提示条状态机（P1-1 / P1-2 / P1-3）');
+
+/** 带双向链表的结果容器，模拟 insertBefore / nextElementSibling */
+function makeDomList(initial) {
+  const kids = (initial || []).slice();
+  const sync = () => kids.forEach((k, i) => {
+    k.nextElementSibling = kids[i + 1] || null;
+    k.previousElementSibling = kids[i - 1] || null;
+  });
+  sync();
+  return {
+    kids,
+    get firstChild() { return kids[0] || null; },
+    get firstElementChild() { return kids[0] || null; },
+    insertBefore(node, ref) {
+      const i = ref ? kids.indexOf(ref) : kids.length;
+      kids.splice(i < 0 ? kids.length : i, 0, node);
+      sync();
+    },
+    appendChild(node) { kids.push(node); sync(); },
+  };
+}
+
+function makeGuardEnv(items) {
+  const { sandbox, api } = makeEnv({ hostname: 'www.bing.com', search: '?q=' + encodeURIComponent('微信下载') });
+  const byId = new Map();
+  const created = [];
+  const list = makeDomList(items);
+  const baseCreate = sandbox.document.createElement;
+
+  sandbox.document.createElement = (tag) => {
+    const el = baseCreate(tag);
+    created.push(el);
+    Object.defineProperty(el, 'id', {
+      configurable: true,
+      get() { return el._id || ''; },
+      set(v) { el._id = v; if (v) byId.set(v, el); },
+    });
+    el.remove = () => {
+      if (el._id) byId.delete(el._id);
+      const i = created.indexOf(el);
+      if (i >= 0) created.splice(i, 1);
+    };
+    return el;
+  };
+  sandbox.document.querySelectorAll = (sel) => {
+    if (sel.indexOf('b_algo') >= 0 || sel === '[data-cs-guard]') return items.slice();
+    if (sel.indexOf('cs-guard-badge') >= 0) return created.filter(e => e.className === 'cs-guard-badge');
+    return [];
+  };
+  sandbox.document.querySelector = (sel) => {
+    if (sel === '#cs-guard-banner') return byId.get('cs-guard-banner') || null;
+    if (sel === '#b_results') return list;
+    return null;
+  };
+  sandbox.document.getElementById = (id) => byId.get(id) || null;
+
+  // 让 fakeItem 支持 removeAttribute（清理分类标记时用到）
+  items.forEach(it => {
+    it.removeAttribute = (a) => {
+      if (a === 'data-cs-guard') delete it.dataset.csGuard;
+      if (a === 'data-cs-guard-name') delete it.dataset.csGuardName;
+    };
+  });
+  return { sandbox, api, list, byId, created, items };
+}
+{
+  const off = fakeItem({ href: 'https://weixin.qq.com/dl', title: '微信官网', text: '微信官网' });
+  const normal = fakeItem({ href: 'https://help.example.com/q', title: '如何下载软件', text: '经验分享' });
+  const env = makeGuardEnv([normal, off]);
+
+  env.api.runGuardian();                       // 第一轮
+  const banner1 = env.byId.get('cs-guard-banner');
+  check('第一轮：横幅已插入', !!banner1);
+  check('第一轮：横幅位于结果区首位（P1-2）', env.list.kids[0] === banner1);
+  check('第一轮：官网已置顶到横幅之后', env.list.kids[1] === off);
+
+  env.api.runGuardian();                       // 第二轮（MutationObserver 会不断触发）
+  const banner2 = env.byId.get('cs-guard-banner');
+  check('第二轮：横幅仍在，未闪现即消失（P1-1）', !!banner2);
+  check('第二轮：横幅仍是第一个子节点（P1-2）', env.list.kids[0] === banner2);
+  check('第二轮：横幅未被重复插入', env.list.kids.filter(k => k === banner2).length === 1);
+}
+{
+  // 【P1-3】横幅自身是结果容器的直接子 div：不得被当成搜索结果分类/打标
+  const off = fakeItem({ href: 'https://weixin.qq.com/dl', title: '微信官网', text: '微信官网' });
+  const env = makeGuardEnv([off]);
+  env.api.runGuardian();
+  const banner = env.byId.get('cs-guard-banner');
+  // 把横幅塞进结果列表（真实页面里它就是 #content_left 的直接子 div）
+  env.list.appendChild(banner);
+  env.api.runGuardian();
+  check('横幅不会被当成搜索结果分类（P1-3）', banner.dataset === undefined || banner.dataset.csGuard === undefined);
+}
+
+/* ===================================================================== *
+ * J. 关闭护航后的痕迹清理（P1-4）
+ * ================================================================== */
+section('J. 关闭护航后痕迹清理（P1-4）');
+{
+  const off = fakeItem({ href: 'https://weixin.qq.com/dl', title: '微信官网', text: '微信官网' });
+  const dl = fakeItem({ href: 'https://www.pc6.com/soft/1', title: '微信下载 pc6', text: 'pc6 微信下载' });
+  const env = makeGuardEnv([off, dl]);
+  env.api.runGuardian();
+  check('清理前：徽章已注入', env.created.filter(e => e.className === 'cs-guard-badge').length === 2);
+  check('清理前：下载站已置灰', dl.style.opacity === '0.6');
+
+  env.api.cfg().guardian.enabled = false;
+  env.api.runGuardian();
+  check('关闭护航 → 徽章已移除', env.created.filter(e => e.className === 'cs-guard-badge').length === 0);
+  check('关闭护航 → 置灰已还原', dl.style.opacity === '');
+  check('关闭护航 → 分类标记已清除', off.dataset.csGuard === undefined && dl.dataset.csGuard === undefined);
+  check('关闭护航 → 横幅已移除', !env.byId.has('cs-guard-banner'));
+}
+{
+  // 只关「下载站警示」开关：黄标与置灰要撤掉，绿标保留
+  const off = fakeItem({ href: 'https://weixin.qq.com/dl', title: '微信官网', text: '微信官网' });
+  const dl = fakeItem({ href: 'https://www.pc6.com/soft/1', title: '微信下载 pc6', text: 'pc6 微信下载' });
+  const env = makeGuardEnv([off, dl]);
+  env.api.runGuardian();
+  env.api.cfg().guardian.warnDownload = false;
+  env.api.runGuardian();
+  check('关闭下载站警示 → 置灰还原', dl.style.opacity === '');
+  check('关闭下载站警示 → 官网绿标不受影响', off.dataset.csGuard === 'official');
+}
+
+/* ===================================================================== *
+ * K. 护航分类纯逻辑（P1-5 域名优先 / P1-6 仿冒站 / 防误伤）
+ * ================================================================== */
+section('K. 护航分类逻辑（P1-5 / P1-6）');
+{
+  const { api } = makeEnv();
+  const cl = (href, text, q) => api.probe.classifyItem(href, text, q || '微信下载').kind;
+
+  check('官网域名 → official', cl('https://weixin.qq.com/x', '微信官网') === 'official');
+  check('下载站域名 → danger', cl('https://www.pc6.com/1', '微信下载') === 'danger');
+  check('仿冒站：品牌词 + 陌生域名 + 诱导下载 → danger（P1-6）',
+    cl('https://www.xzy12345.com/weixin-setup.exe', '微信官方下载 高速下载') === 'danger');
+  check('正文提到下载站但域名是官网 → 仍为 official（P1-5）',
+    cl('https://weixin.qq.com/x', '微信官网 pc6.com 也有') === 'official');
+  check('百科结果不被误判为下载站（无误伤）',
+    cl('https://baike.baidu.com/item/微信', '微信百科 介绍') === 'candidate');
+  check('无关官网域名不抢官方（知乎谈微信下载）',
+    cl('https://www.zhihu.com/p/1', '微信怎么下载？- 知乎') === 'candidate');
+  check('陌生域名且无品牌词 → unknown',
+    cl('https://help.example.com/q', '如何下载软件') === '');
+  check('无域名时仅文本品牌名 → candidate（不判 official）',
+    cl('', '微信 频道页介绍') === 'candidate');
+}
+
+/* ===================================================================== *
+ * L. 配置净化（P2-5）
+ * ================================================================== */
+section('L. 配置净化（P2-5）');
+{
+  const { api } = makeEnv();
+  const nc = api.probe.normalizeConfig;
+  check('keywords 去空白去重并剔除非字符串',
+    JSON.stringify(nc({ keywords: [' 广告 ', 1, null, '广告', ''] }).keywords) === '["广告"]');
+  check('officialSites 类型损坏 → 回落内置库',
+    nc({ officialSites: ['weixin.qq.com'] }).officialSites.length > 50);
+  check('officialSites 可主动清空', nc({ officialSites: [] }).officialSites.length === 0);
+  check('officialSites 二元组缺名 → 用域名兜底',
+    JSON.stringify(nc({ officialSites: [['a.example.com']] }).officialSites) === '[["a.example.com","a.example.com"]]');
+  check('sites 非布尔 → 回落默认', nc({ sites: { baidu: 'yes' } }).sites.baidu === true);
+  check('guardian 非布尔 → 回落默认', nc({ guardian: { enabled: 0 } }).guardian.enabled === true);
+  check('null 配置 → 默认关键词为空数组', JSON.stringify(nc(null).keywords) === '[]');
+  check('downloadSites 保留用户清空', JSON.stringify(nc({ downloadSites: [] }).downloadSites) === '[]');
+}
+
+/* ===================================================================== *
+ * M. domainOf（P1-5 配套）
+ * ================================================================== */
+section('M. domainOf 域名提取');
+{
+  const { api } = makeEnv();
+  const d = api.probe.domainOf;
+  check('带协议与端口', d('https://WeiXin.QQ.com:8080/a?b=1') === 'weixin.qq.com');
+  check('裸域名（c-showurl）', d('weixin.qq.com') === 'weixin.qq.com');
+  check('带 userinfo', d('http://u:p@x.example.com/y') === 'x.example.com');
+  check('空输入', d('') === '');
+  check('非法输入不抛异常', d('::::') === '');
+}
+
+/* ===================================================================== *
+ * N. 360 角标识别开关联动（P2-1）
+ * ================================================================== */
+section('N. 360 角标开关联动（P2-1）');
+{
+  const mkAd = () => {
+    const badge = {
+      tagName: 'SPAN', textContent: '广告',
+      querySelector: () => null,
+      cloneNode: () => ({ textContent: '广告', querySelectorAll: () => [] }),
+    };
+    const el = {
+      _removed: false, dataset: {}, style: {}, textContent: '广告 结果',
+      querySelectorAll: () => [badge],
+      querySelector: () => null,
+      matches: () => false,
+      remove() { el._removed = true; },
+    };
+    return el;
+  };
+  {
+    const { sandbox, api } = makeEnv({ hostname: 'www.so.com' });
+    const el = mkAd();
+    sandbox.document.querySelectorAll = (sel) => (sel.indexOf('res-list') >= 0 ? [el] : []);
+    api.cfg().badgeText = true;
+    api.runAll();
+    check('开启角标识别 → 360 广告结果被移除', el._removed === true);
+  }
+  {
+    const { sandbox, api } = makeEnv({ hostname: 'www.so.com' });
+    const el = mkAd();
+    sandbox.document.querySelectorAll = (sel) => (sel.indexOf('res-list') >= 0 ? [el] : []);
+    api.cfg().badgeText = false;
+    api.runAll();
+    check('关闭角标识别 → 360 广告结果保留（P2-1）', el._removed === false);
+  }
+}
+
 console.log('\n---------------------------------------------');
 console.log('通过 ' + passed + ' / 失败 ' + failed);
 process.exit(failed ? 1 : 0);
